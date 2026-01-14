@@ -1,25 +1,30 @@
-# Music-Hood 🎧🧅
+# Music-Hood
 
-A local, folder-first desktop music player inspired by Musicolet’s UX, with optional one-click audio import from supported sources (e.g., YouTube via yt-dlp as an external dependency).
+A local-first, folder-based music player for Windows/Linux with an optional YouTube audio capture helper.
 
-## Principles (non-negotiable)
-- **Local-first**: works perfectly with plain folders, no account, no cloud required.
-- **Library = folders**: user owns structure, app never forces it.
-- **Fast & quiet**: instant search, instant queueing, no bloat.
-- **Keyboard-native**: everything usable without a mouse.
-- **Truthful metadata**: tags are editable, visible, and never “mystery meat”.
-- **Respect user boundaries**: no telemetry by default; explicit opt-in only.
-- **Legal sanity**: the app does not ship copyrighted content; import features rely on user-provided links and user-installed tools; users are responsible for rights/ToS compliance.
+## What this is
+- A desktop app that treats your folders as the source of truth.
+- Fast library scan, great search, playlists as files, no cloud dependency.
+- Optional helper: one-click YouTube (yt-dlp) audio extraction into your library.
 
-## Scope v0 (MVP)
-- Library scan of selected folders
-- Music playback with queue
-- Tag editor (basic)
-- Playlist management (local)
-- Import pipeline (optional): yt-dlp + ffmpeg integration, post-process naming/tagging presets
+## What this is NOT
+- A streaming service.
+- A DRM bypass toolkit.
+- A tracker.
+
+## Core principles
+- Local-first by default
+- Privacy by design
+- Transparent file structure
+- Cross-platform parity (Win + Linux)
 
 ## Docs
-- UX mapping: `docs/UX_MAPPING.md`
-- Screens: `docs/SCREENS.md`
-- Shortcuts: `docs/SHORTCUTS.md`
-- Folder/navigation rules: `docs/FOLDER_RULES.md`
+- docs/PROJECT.md
+- docs/UX_MAPPING.md
+- docs/SCREENS.md
+- docs/SHORTCUTS.md
+- docs/FOLDER_RULES.md
+- LEGAL.md
+
+## Status
+Early scaffolding: requirements, UX mapping, and build plan.
