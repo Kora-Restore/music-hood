@@ -1,124 +1,25 @@
-\# Music-Hood
-
-
-
-A local-first, folder-based music player for desktop systems.
-
-
-
-Music-Hood exists because mobile apps like Musicolet proved that:
-
-\- fast
-
-\- local
-
-\- metadata-driven
-
-\- no-account
-
-\- no-cloud
-
-
-
-music players can be \*good\*.
-
-
-
-Desktop forgot.
-
-
-
-\## Core Principles
-
-
-
-\- \*\*Local-first\*\*  
-
-&nbsp; Plays files from folders you own. No libraries locked behind databases.
-
-
-
-\- \*\*No accounts, no telemetry, no DRM\*\*
-
-&nbsp; Ever.
-
-
-
-\- \*\*Folder truth\*\*
-
-&nbsp; Your filesystem \*is\* the source of truth, not an internal index.
-
-
-
-\- \*\*Fast by default\*\*
-
-&nbsp; Startup in milliseconds, not seconds.
-
-
-
-\- \*\*Explicit actions\*\*
-
-&nbsp; Nothing runs in the background without the user choosing it.
-
-
-
-\## Scope (Initial)
-
-
-
-\- Local playback (MP3, FLAC, M4A, OGG, WAV)
-
-\- Folder-based browsing
-
-\- Playlists as files (M3U / M3U8)
-
-\- Keyboard-first navigation
-
-
-
-\## Future (Opt-in)
-
-
-
-\- YouTube audio extraction using user-provided tools
-
-\- Batch downloads into local folders
-
-\- Metadata editing
-
-\- Cross-platform (Windows / Linux first)
-
-
-
-\## Non-Goals
-
-
-
-\- Streaming services
-
-\- Social features
-
-\- Recommendation engines
-
-\- Ads
-
-\- “AI DJ”
-
-\- Electron bloat
-
-
-
-\## Philosophy
-
-
-
-This is not a product.
-
-This is infrastructure for people who already own their music.
-
-
-
-If you’re looking to monetize attention, you’re in the wrong place.
-
-
-
+# Music-Hood 🎧🧅
+
+A local, folder-first desktop music player inspired by Musicolet’s UX, with optional one-click audio import from supported sources (e.g., YouTube via yt-dlp as an external dependency).
+
+## Principles (non-negotiable)
+- **Local-first**: works perfectly with plain folders, no account, no cloud required.
+- **Library = folders**: user owns structure, app never forces it.
+- **Fast & quiet**: instant search, instant queueing, no bloat.
+- **Keyboard-native**: everything usable without a mouse.
+- **Truthful metadata**: tags are editable, visible, and never “mystery meat”.
+- **Respect user boundaries**: no telemetry by default; explicit opt-in only.
+- **Legal sanity**: the app does not ship copyrighted content; import features rely on user-provided links and user-installed tools; users are responsible for rights/ToS compliance.
+
+## Scope v0 (MVP)
+- Library scan of selected folders
+- Music playback with queue
+- Tag editor (basic)
+- Playlist management (local)
+- Import pipeline (optional): yt-dlp + ffmpeg integration, post-process naming/tagging presets
+
+## Docs
+- UX mapping: `docs/UX_MAPPING.md`
+- Screens: `docs/SCREENS.md`
+- Shortcuts: `docs/SHORTCUTS.md`
+- Folder/navigation rules: `docs/FOLDER_RULES.md`
