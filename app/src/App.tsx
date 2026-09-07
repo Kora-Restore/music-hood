@@ -9,7 +9,19 @@ type Track = {
   path: string;
   name: string;
   playlist: string;
+  title: string;
+  artist: string;
+  duration_secs: number;
 };
+
+// "Schrotthagen, Giovanni Berg" / "A & B" / "A feat. B" → the individual names.
+function splitArtists(artist: string): string[] {
+  if (!artist) return [];
+  return artist
+    .split(/\s*(?:,|\/|&|;|\bfeat\.?\b|\bft\.?\b|\bx\b|\bvs\.?\b)\s*/i)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
 
 // One settings store, one key per setting. (An earlier edit had two store
 // instances writing two different keys to the same file — Import broke on it.)
@@ -118,6 +130,10 @@ export default function App() {
   const [allTracks, setAllTracks] = useState<Track[]>([]);
 
   const [playlist, setPlaylist] = useState<string>("(all)");
+  // Left panel: folder playlists (the truth) or the virtual per-artist view (from tags).
+  const [sideTab, setSideTab] = useState<"playlists" | "artists">("playlists");
+  const [artistView, setArtistView] = useState<string>("");
+  const [artistQuery, setArtistQuery] = useState<string>("");
   const [query, setQuery] = useState<string>("");
 
   const [currentPath, setCurrentPath] = useState<string>("");
@@ -200,16 +216,42 @@ export default function App() {
     return ["(all)", ...arr.filter((x) => x !== "(all)")];
   }, [allTracks]);
 
+  // Artist index: every artist named in a tag (collaborations count under each name) → track count.
+  const artists = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const t of allTracks) {
+      for (const a of splitArtists(t.artist)) counts.set(a, (counts.get(a) ?? 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+  }, [allTracks]);
+
+  const shownArtists = useMemo(() => {
+    const q = artistQuery.trim().toLowerCase();
+    return q ? artists.filter((a) => a.name.toLowerCase().includes(q)) : artists;
+  }, [artists, artistQuery]);
+
   const filteredTracks = useMemo(() => {
     const q = query.trim().toLowerCase();
     return allTracks.filter((t) => {
-      if (playlist !== "(all)" && (t.playlist || "(root)") !== playlist) return false;
+      if (artistView) {
+        // virtual playlist: every track by this artist, whatever folder it lives in
+        if (!splitArtists(t.artist).includes(artistView)) return false;
+      } else if (playlist !== "(all)" && (t.playlist || "(root)") !== playlist) {
+        return false;
+      }
       if (!q) return true;
-      return t.name.toLowerCase().includes(q);
+      return t.name.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q);
     });
-  }, [allTracks, playlist, query]);
+  }, [allTracks, playlist, artistView, query]);
 
   const shownCount = filteredTracks.length;
+
+  const currentTrack = useMemo(
+    () => (currentPath ? allTracks.find((t) => t.path === currentPath) ?? null : null),
+    [allTracks, currentPath]
+  );
 
   const selectedTrack = useMemo(
     () => (selectedPath ? allTracks.find((t) => t.path === selectedPath) ?? null : null),
@@ -678,6 +720,23 @@ export default function App() {
           border-color: rgba(0,255,191,0.35);
           background: rgba(0,255,191,0.10);
         }
+        .panelHeader.tabs{ display:flex; gap: 6px; padding: 8px 10px; }
+        .tab{
+          border: 1px solid transparent;
+          background: transparent;
+          color: var(--textDim);
+          font: inherit; font-weight: 700;
+          padding: 5px 10px;
+          border-radius: 10px;
+          cursor: pointer;
+        }
+        .tab.active{ color: var(--text); background: rgba(255,255,255,0.06); border-color: var(--border); }
+        .tabCount{ color: var(--textDim); font-weight: 500; font-size: 12px; margin-left: 4px; }
+        .artistPill{ display:flex; justify-content:space-between; align-items:center; gap: 10px; }
+        .artistName{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .artistCount{ color: var(--textDim); font-size: 12px; flex:none; }
+        .accentText{ color: var(--accent); }
+        .dimText{ color: var(--textDim); font-weight: 500; }
         .searchRow{
           flex:none;
           padding: 10px;
@@ -875,22 +934,74 @@ export default function App() {
 
       <div className="content">
         <div className="panel">
-          <div className="panelHeader">Playlists</div>
-          <div className="list">
-            {playlists.map((p) => (
-              <div
-                key={p}
-                className={`pill ${p === playlist ? "active" : ""}`}
-                onClick={() => setPlaylist(p)}
-              >
-                {p}
-              </div>
-            ))}
+          <div className="panelHeader tabs">
+            <button
+              className={`tab ${sideTab === "playlists" ? "active" : ""}`}
+              onClick={() => setSideTab("playlists")}
+            >
+              Playlists
+            </button>
+            <button
+              className={`tab ${sideTab === "artists" ? "active" : ""}`}
+              onClick={() => setSideTab("artists")}
+            >
+              Artists <span className="tabCount">{artists.length}</span>
+            </button>
           </div>
+
+          {sideTab === "playlists" ? (
+            <div className="list">
+              {playlists.map((p) => (
+                <div
+                  key={p}
+                  className={`pill ${!artistView && p === playlist ? "active" : ""}`}
+                  onClick={() => {
+                    setArtistView("");
+                    setPlaylist(p);
+                  }}
+                >
+                  {p}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <>
+              <div className="searchRow">
+                <input
+                  className="search"
+                  placeholder="Filter artists…"
+                  value={artistQuery}
+                  onChange={(e) => setArtistQuery(e.target.value)}
+                />
+              </div>
+              <div className="list">
+                {shownArtists.map((a) => (
+                  <div
+                    key={a.name}
+                    className={`pill artistPill ${a.name === artistView ? "active" : ""}`}
+                    onClick={() => setArtistView((cur) => (cur === a.name ? "" : a.name))}
+                    title={`All ${a.count} track${a.count === 1 ? "" : "s"} by ${a.name}, across every folder`}
+                  >
+                    <span className="artistName">{a.name}</span>
+                    <span className="artistCount">{a.count}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </div>
 
         <div className="panel">
-          <div className="panelHeader">Tracks</div>
+          <div className="panelHeader">
+            {artistView ? (
+              <>
+                Tracks · <span className="accentText">{artistView}</span>
+                <span className="dimText"> · all folders</span>
+              </>
+            ) : (
+              "Tracks"
+            )}
+          </div>
           <div className="searchRow">
             <input
               className="search"
@@ -931,7 +1042,9 @@ export default function App() {
         <div className="nowPlaying">
           <div className="npTitle">{currentName || "Nothing playing"}</div>
           <div className="npSub">
-            {currentPlaylist ? `${currentPlaylist} • ${allTracks.length} tracks` : `All playlists • ${allTracks.length} tracks`}
+            {currentPlaylist
+              ? `${currentTrack?.artist ? currentTrack.artist + " • " : ""}${currentPlaylist}`
+              : `All playlists • ${allTracks.length} tracks`}
           </div>
           {currentPath ? (
             <Dropdown

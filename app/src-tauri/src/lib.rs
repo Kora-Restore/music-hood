@@ -7,11 +7,43 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::process::{CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
+use lofty::prelude::*;
+use rayon::prelude::*;
+
 #[derive(Debug, Clone, Serialize)]
 struct Track {
   path: String,
   name: String,
   playlist: String,
+  /// Tag title, or "" when the file has none. The UI keeps showing the filename (folder truth);
+  /// tags feed the optional virtual views (artist) only.
+  title: String,
+  /// Tag artist, or — when the file has no tag — the part after the last " - " of the filename
+  /// (the library's "Song - Artist" convention), or "".
+  artist: String,
+  duration_secs: u64,
+}
+
+/// Read title/artist/duration from a file's tags. Never fails: a file without tags
+/// (or one lofty cannot parse) just yields empty fields.
+fn read_tags(path: &Path) -> (String, String, u64) {
+  let Ok(tagged) = lofty::read_from_path(path) else {
+    return (String::new(), String::new(), 0);
+  };
+  let secs = tagged.properties().duration().as_secs();
+  let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
+  let title = tag.and_then(|t| t.title().map(|s| s.trim().to_string())).unwrap_or_default();
+  let artist = tag.and_then(|t| t.artist().map(|s| s.trim().to_string())).unwrap_or_default();
+  (title, artist, secs)
+}
+
+/// "Song - Artist.m4a" → "Artist" (library convention); "" when the name has no " - ".
+fn artist_from_filename(name: &str) -> String {
+  let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+  match stem.rsplit_once(" - ") {
+    Some((_, artist)) if !artist.trim().is_empty() => artist.trim().to_string(),
+    _ => String::new(),
+  }
 }
 
 fn is_audio_file(path: &Path) -> bool {
@@ -67,6 +99,9 @@ fn scan_dir(root: &Path, dir: &Path, out: &mut Vec<Track>) -> Result<(), String>
         path: path.to_string_lossy().to_string(),
         name,
         playlist,
+        title: String::new(),
+        artist: String::new(),
+        duration_secs: 0,
       });
     }
   }
@@ -82,6 +117,14 @@ fn scan_music_folder(dir: String) -> Result<Vec<Track>, String> {
 
   let mut tracks = Vec::new();
   scan_dir(&root, &root, &mut tracks)?;
+
+  // Tag pass, in parallel: thousands of files, each a small header read.
+  tracks.par_iter_mut().for_each(|t| {
+    let (title, artist, secs) = read_tags(Path::new(&t.path));
+    t.title = title;
+    t.artist = if artist.is_empty() { artist_from_filename(&t.name) } else { artist };
+    t.duration_secs = secs;
+  });
 
   tracks.sort_by(|a, b| a.playlist.cmp(&b.playlist).then(a.name.cmp(&b.name)));
   Ok(tracks)
@@ -145,10 +188,15 @@ fn move_track(args: MoveArgs) -> Result<Track, String> {
   }
   std::fs::rename(&src, &dest).map_err(|e| format!("Move failed: {e}"))?;
 
+  let name = file_name.to_string_lossy().to_string();
+  let (title, artist, secs) = read_tags(&dest);
   Ok(Track {
     path: dest.to_string_lossy().to_string(),
-    name: file_name.to_string_lossy().to_string(),
     playlist: target,
+    artist: if artist.is_empty() { artist_from_filename(&name) } else { artist },
+    name,
+    title,
+    duration_secs: secs,
   })
 }
 
