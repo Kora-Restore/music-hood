@@ -121,6 +121,8 @@ export default function App() {
   const [query, setQuery] = useState<string>("");
 
   const [currentPath, setCurrentPath] = useState<string>("");
+  // Single click selects (highlight only); double click plays. Selection is what "Move selected" acts on.
+  const [selectedPath, setSelectedPath] = useState<string>("");
   const [currentName, setCurrentName] = useState<string>("");
   const [currentPlaylist, setCurrentPlaylist] = useState<string>("");
 
@@ -209,6 +211,11 @@ export default function App() {
 
   const shownCount = filteredTracks.length;
 
+  const selectedTrack = useMemo(
+    () => (selectedPath ? allTracks.find((t) => t.path === selectedPath) ?? null : null),
+    [allTracks, selectedPath]
+  );
+
   const currentIndex = useMemo(() => {
     if (!currentPath) return -1;
     return filteredTracks.findIndex((t) => t.path === currentPath);
@@ -220,6 +227,20 @@ export default function App() {
     if (shuffle) return Math.floor(Math.random() * n);
     const base = currentIndex >= 0 ? currentIndex : 0;
     return (base + delta + n) % n;
+  }
+
+  // Re-read the current Music folder (after renames/moves done outside the app).
+  async function rescanLibrary() {
+    const lib = folderRef.current;
+    if (!lib) return;
+    try {
+      setStatus("Scanning…");
+      const found = await invoke<Track[]>("scan_music_folder", { dir: lib });
+      setAllTracks(found);
+      setStatus(`Found ${found.length} tracks`);
+    } catch (err) {
+      setStatus(`Scan error: ${String(err)}`);
+    }
   }
 
   async function importFolder() {
@@ -289,10 +310,10 @@ export default function App() {
     };
   }
 
-  // Move the track that is playing into another playlist folder, without stopping it.
-  async function moveCurrentTo(target: string) {
+  // Move any track into another playlist folder. If it is the one playing, the player
+  // is re-pointed at the new path without losing the position; otherwise playback is untouched.
+  async function moveTrackTo(fromPath: string, target: string) {
     const lib = folderRef.current;
-    const fromPath = currentPath;
     if (!fromPath || !lib || !target) return;
 
     try {
@@ -301,9 +322,13 @@ export default function App() {
       });
 
       setAllTracks((prev) => prev.map((t) => (t.path === fromPath ? moved : t)));
+      if (selectedPath === fromPath) setSelectedPath(moved.path);
+      setStatus(`Moved "${displayName(moved.name)}" to ${moved.playlist}`);
+
+      if (fromPath !== currentPath) return;
+
       setCurrentPath(moved.path);
       setCurrentPlaylist(moved.playlist);
-      setStatus(`Moved to ${moved.playlist}`);
 
       // Re-point the player at the new path, keeping the position.
       const audio = audioRef.current;
@@ -679,9 +704,17 @@ export default function App() {
           background: rgba(255,255,255,0.02);
           margin-bottom:8px;
         }
+        .trackRow{ user-select: none; }
+        .trackRow.selected{
+          border-color: rgba(255,255,255,0.18);
+          background: rgba(255,255,255,0.07);
+        }
         .trackRow.active{
           border-color: rgba(140,25,255,0.35);
           background: rgba(140,25,255,0.10);
+        }
+        .trackRow.active.selected{
+          border-color: rgba(140,25,255,0.6);
         }
 
         .player{
@@ -773,6 +806,11 @@ export default function App() {
         <div className="brand">
           <div>music-hood</div>
           <button className="btn" onClick={importFolder}>Import</button>
+          {folder ? (
+            <button className="btn" onClick={rescanLibrary} title="Re-read the Music folder">
+              Rescan
+            </button>
+          ) : null}
         </div>
         <div className="status">Status: {status}</div>
       </div>
@@ -860,6 +898,15 @@ export default function App() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
+            {selectedTrack ? (
+              <Dropdown
+                value=""
+                placeholder="Move selected to…"
+                title={`Move "${displayName(selectedTrack.name)}" to another playlist folder`}
+                options={targetOptions.filter((name) => name !== (selectedTrack.playlist || "(root)"))}
+                onSelect={(target) => moveTrackTo(selectedTrack.path, target)}
+              />
+            ) : null}
             <button className="btn" onClick={() => setShuffle((s) => !s)}>
               {shuffle ? "Shuffle: on" : "Shuffle: off"}
             </button>
@@ -868,8 +915,10 @@ export default function App() {
             {filteredTracks.map((t) => (
               <div
                 key={t.path}
-                className={`trackRow ${t.path === currentPath ? "active" : ""}`}
-                onClick={() => loadAndPlay(t)}
+                className={`trackRow ${t.path === currentPath ? "active" : ""} ${t.path === selectedPath ? "selected" : ""}`}
+                onClick={() => setSelectedPath((p) => (p === t.path ? "" : t.path))}
+                onDoubleClick={() => loadAndPlay(t)}
+                title="Click to select · double-click to play"
               >
                 {displayName(t.name)}
               </div>
@@ -892,7 +941,7 @@ export default function App() {
               placeholder="Move to…"
               title="Move this track to another playlist folder"
               options={targetOptions.filter((name) => name !== currentPlaylist)}
-              onSelect={moveCurrentTo}
+              onSelect={(target) => moveTrackTo(currentPath, target)}
             />
           ) : null}
         </div>
