@@ -94,6 +94,62 @@ struct YtDlpArgs {
   url: String,
   #[serde(alias = "libraryDir")]
   library_dir: Option<String>,
+  /// First-level folder under the library root (= a playlist) the file lands in.
+  #[serde(default, alias = "targetFolder")]
+  target_folder: Option<String>,
+}
+
+/// A target folder is a single folder NAME under the library root — never a path.
+fn sanitize_folder_name(raw: &str) -> Result<String, String> {
+  let name = raw.trim().trim_matches('.').trim();
+  if name.is_empty() {
+    return Err("Download folder name is empty".into());
+  }
+  if name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|']) {
+    return Err(format!("Download folder name contains a character Windows rejects: {name}"));
+  }
+  Ok(name.to_string())
+}
+
+// ---------- move a track to another playlist folder ----------
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct MoveArgs {
+  path: String,
+  #[serde(alias = "libraryDir")]
+  library_dir: String,
+  #[serde(alias = "targetFolder")]
+  target_folder: String,
+}
+
+/// Moves one file into `<library root>/<target folder>/` (same name). Returns the updated Track.
+#[tauri::command]
+fn move_track(args: MoveArgs) -> Result<Track, String> {
+  let root = PathBuf::from(args.library_dir.trim());
+  let src = PathBuf::from(&args.path);
+  if !src.is_file() {
+    return Err(format!("File not found: {}", src.display()));
+  }
+  if !src.starts_with(&root) {
+    return Err("Track is outside the Music folder".into());
+  }
+  let target = sanitize_folder_name(&args.target_folder)?;
+  let dest_dir = root.join(&target);
+  std::fs::create_dir_all(&dest_dir)
+    .map_err(|e| format!("Failed to create folder {}: {e}", dest_dir.display()))?;
+
+  let file_name = src.file_name().ok_or_else(|| "Bad file name".to_string())?.to_os_string();
+  let dest = dest_dir.join(&file_name);
+  if dest.exists() {
+    return Err(format!("{} already exists in {target}", file_name.to_string_lossy()));
+  }
+  std::fs::rename(&src, &dest).map_err(|e| format!("Move failed: {e}"))?;
+
+  Ok(Track {
+    path: dest.to_string_lossy().to_string(),
+    name: file_name.to_string_lossy().to_string(),
+    playlist: target,
+  })
 }
 
 fn find_bin_by_prefix(dir: &Path, prefix: &str) -> Option<PathBuf> {
@@ -129,70 +185,79 @@ fn sidecar_bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
 async fn ytdlp_download_audio(app: AppHandle, args: YtDlpArgs) -> Result<(), String> {
   let url = args.url;
 
-  // Prefer user-selected library dir; fallback to OS Music dir.
-  let base_dir: PathBuf = if let Some(ld) = args.library_dir {
-    let ld = ld.trim().to_string();
-    if !ld.is_empty() {
-      PathBuf::from(ld)
-    } else {
-      app
-        .path()
-        .audio_dir()
-        .map_err(|e| format!("Failed to get audio dir: {e}"))?
-    }
-  } else {
-    app
-      .path()
-      .audio_dir()
-      .map_err(|e| format!("Failed to get audio dir: {e}"))?
+  // The library root is REQUIRED. No silent fallback to the OS Music folder —
+  // that is how downloads used to vanish into a folder the app never scans.
+  let base_dir: PathBuf = match args.library_dir.as_deref().map(str::trim) {
+    Some(ld) if !ld.is_empty() => PathBuf::from(ld),
+    _ => return Err("No Music folder selected — click Import first.".into()),
   };
+  if !base_dir.is_dir() {
+    return Err(format!("Music folder does not exist: {}", base_dir.display()));
+  }
 
-  let out_dir = base_dir.join("Downloads");
-  std::fs::create_dir_all(&out_dir).map_err(|e| format!("Failed to create Downloads dir: {e}"))?;
+  let target = sanitize_folder_name(args.target_folder.as_deref().unwrap_or("Downloads"))?;
+  let out_dir = base_dir.join(&target);
+  std::fs::create_dir_all(&out_dir)
+    .map_err(|e| format!("Failed to create folder {}: {e}", out_dir.display()))?;
 
+  // Filename = "Track - Artist" (Matteo's library convention) when YouTube knows both,
+  // else the cleaned video title. `mh_name` is set by --parse-metadata below only when
+  // track AND artist are present (a missing field renders as "NA", which the lookaheads reject).
   let output_template = out_dir
-    .join("%(title).200s.%(ext)s")
+    .join("%(mh_name,title)s.%(ext)s")
     .to_string_lossy()
     .to_string();
+  const TITLE_JUNK: &str = r"(?i)\s*[\(\[][^\)\]]*\b(official|lyrics?|audio|visuali[sz]er|4k|hd|hq|music video|video|clip|full album|full)\b[^\)\]]*[\)\]]";
+  const MH_NAME_PARSE: &str = r"%(track)s - %(artist)s:(?P<mh_name>(?!NA - ).+ - (?!NA$).+)";
 
   // Wire yt-dlp to the bundled Deno runtime (fixes the “No supported JavaScript runtime” warning).
   let bin_dir = sidecar_bin_dir(&app)?;
   let deno_path = find_bin_by_prefix(&bin_dir, "deno-")
     .ok_or_else(|| format!("Could not find bundled deno in: {}", bin_dir.display()))?;
-
   let js_runtime_arg = format!("deno:{}", deno_path.to_string_lossy());
 
-  let mut cmd = app
+  // ffmpeg: use a bundled one if it ever lands in bin/, else whatever is on PATH.
+  let ffmpeg_args: Vec<String> = match find_bin_by_prefix(&bin_dir, "ffmpeg") {
+    Some(p) => vec!["--ffmpeg-location".into(), p.to_string_lossy().to_string()],
+    None => vec![],
+  };
+
+  let mut argv: Vec<String> = vec![
+    "--no-playlist".into(),
+    "--js-runtimes".into(),
+    js_runtime_arg,
+  ];
+  argv.extend(ffmpeg_args);
+  argv.extend(
+    [
+      "-f",
+      "bestaudio[ext=m4a]/bestaudio",
+      // title cleaning + name assembly (order matters: clean first, then parse)
+      "--replace-in-metadata", "title", TITLE_JUNK, "",
+      "--replace-in-metadata", "title", r"\s{2,}", " ",
+      "--parse-metadata", MH_NAME_PARSE,
+      "-o", output_template.as_str(),
+      "--windows-filenames",
+      "--trim-filenames", "200",
+      "--embed-metadata",
+      "--embed-thumbnail",
+      "--extract-audio",
+      "--audio-format", "m4a",
+      "--no-progress",
+      "--console-title",
+      url.as_str(),
+    ]
+    .iter()
+    .map(|s| s.to_string()),
+  );
+
+  let _ = app.emit("ytdlp:stdout", format!("[music-hood] saving into: {}", out_dir.display()));
+
+  let cmd = app
     .shell()
     .sidecar("yt-dlp")
     .map_err(|e| format!("Could not create yt-dlp sidecar: {e}"))?
-    .args([
-      "--no-playlist",
-      "--js-runtimes",
-      js_runtime_arg.as_str(),
-
-      "-f",
-      "bestaudio[ext=m4a]/bestaudio",
-      "-o",
-      output_template.as_str(),
-
-      "--embed-metadata",
-      "--embed-thumbnail",
-      "--add-metadata",
-      "--restrict-filenames",
-      "--windows-filenames",
-      "--trim-filenames",
-      "200",
-
-      "--extract-audio",
-      "--audio-format",
-      "m4a",
-
-      "--no-progress",
-      "--console-title",
-
-      url.as_str(),
-    ])
+    .args(argv)
     .current_dir(out_dir.clone());
 
   let (mut rx, _child) = cmd.spawn().map_err(|e| format!("Failed to spawn yt-dlp: {e}"))?;
@@ -225,7 +290,7 @@ pub fn run() {
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_store::Builder::default().build())
-    .invoke_handler(tauri::generate_handler![scan_music_folder, ytdlp_download_audio])
+    .invoke_handler(tauri::generate_handler![scan_music_folder, ytdlp_download_audio, move_track])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

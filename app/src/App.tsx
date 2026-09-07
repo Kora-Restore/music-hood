@@ -1,12 +1,9 @@
 import { Store } from "@tauri-apps/plugin-store";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-
-const settingsStore = new Store("music-hood.json");
-const STORE_KEY = "libraryDir";
 
 type Track = {
   path: string;
@@ -14,7 +11,82 @@ type Track = {
   playlist: string;
 };
 
+// One settings store, one key per setting. (An earlier edit had two store
+// instances writing two different keys to the same file — Import broke on it.)
 const storePromise = Store.load("music-hood.json");
+const KEY_LIBRARY_DIR = "library_dir";
+const KEY_DOWNLOAD_TARGET = "download_target";
+const DEFAULT_DOWNLOAD_TARGET = "Downloads";
+const NEW_FOLDER_SENTINEL = "__new__";
+
+const KEY_VOLUME = "volume";
+
+// Filename without extension — what the user should read as the title.
+function displayName(fileName: string) {
+  return fileName.replace(/\.[^./\\]+$/, "");
+}
+
+// In-app dropdown. The native <select> popup is drawn by Windows/WebView2 and
+// ignores the app's dark theme (light grey on light grey — unreadable), so we draw our own.
+type DropdownProps = {
+  value: string;
+  options: string[];
+  onSelect: (v: string) => void;
+  placeholder?: string;
+  extra?: { label: string; value: string };
+  up?: boolean;
+  className?: string;
+  title?: string;
+};
+
+function Dropdown({ value, options, onSelect, placeholder, extra, up, className, title }: DropdownProps) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  function pick(v: string) {
+    setOpen(false);
+    onSelect(v);
+  }
+
+  return (
+    <div className={`dd ${className ?? ""}`} ref={ref}>
+      <button type="button" className={`ddBtn ${open ? "open" : ""}`} title={title} onClick={() => setOpen((o) => !o)}>
+        <span className="ddLabel">{value || placeholder || ""}</span>
+        <span className="ddChevron">{up ? "▴" : "▾"}</span>
+      </button>
+      {open ? (
+        <div className={`ddMenu ${up ? "up" : ""}`}>
+          {options.map((o) => (
+            <div key={o} className={`ddItem ${o === value ? "active" : ""}`} onClick={() => pick(o)}>
+              {o}
+            </div>
+          ))}
+          {extra ? (
+            <div className="ddItem ddExtra" onClick={() => pick(extra.value)}>
+              {extra.label}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 const COLORS = {
   bg0: "#0f0f0f",
@@ -56,17 +128,67 @@ export default function App() {
   const [progress, setProgress] = useState<number>(0);
   const [duration, setDuration] = useState<number>(0);
   const [shuffle, setShuffle] = useState<boolean>(false);
+  const [volume, setVolume] = useState<number>(1);
+  const settingsLoadedRef = useRef<boolean>(false);
+
+  // Volume: apply to the player immediately, persist a moment after the slider stops moving
+  // (but never before the saved value has been read, or we'd overwrite it with the default).
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (audio) audio.volume = volume;
+    if (!settingsLoadedRef.current) return;
+    const t = setTimeout(async () => {
+      try {
+        const store = await storePromise;
+        await store.set(KEY_VOLUME, volume);
+        await store.save();
+      } catch {
+        /* non-fatal */
+      }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [volume]);
 
   // Manual download box
   const [downloadUrl, setDownloadUrl] = useState<string>("");
   const [dlBusy, setDlBusy] = useState<boolean>(false);
   const [dlLogs, setDlLogs] = useState<string>("");
 
+  // Where downloads land: a first-level folder under the Music root (= a playlist).
+  const [dlTarget, setDlTarget] = useState<string>(DEFAULT_DOWNLOAD_TARGET);
+  const [newFolderName, setNewFolderName] = useState<string>("");
+  const [newFolderMode, setNewFolderMode] = useState<boolean>(false);
+
   // IMPORTANT: avoid duplicate ytdlp listeners in dev/hmr by using a ref for latest folder
   const folderRef = useRef<string>("");
   useEffect(() => {
     folderRef.current = folder;
   }, [folder]);
+
+  // Folders offered as download targets: every existing playlist folder + the default.
+  const targetOptions = useMemo(() => {
+    const set = new Set<string>([DEFAULT_DOWNLOAD_TARGET]);
+    for (const t of allTracks) {
+      if (t.playlist && t.playlist !== "(root)") set.add(t.playlist);
+    }
+    if (dlTarget) set.add(dlTarget);
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [allTracks, dlTarget]);
+
+  async function chooseTarget(name: string) {
+    const clean = name.trim();
+    if (!clean) return;
+    setDlTarget(clean);
+    setNewFolderMode(false);
+    setNewFolderName("");
+    try {
+      const store = await storePromise;
+      await store.set(KEY_DOWNLOAD_TARGET, clean);
+      await store.save();
+    } catch {
+      /* non-fatal: the choice still applies for this session */
+    }
+  }
 
   const playlists = useMemo(() => {
     const set = new Set<string>();
@@ -104,48 +226,16 @@ export default function App() {
     try {
       const picked = await open({ directory: true, multiple: false });
       if (!picked || typeof picked !== "string") return;
-      
-      await settingsStore.set(STORE_KEY, picked);
-      await settingsStore.save();
 
       setFolder(picked);
       setStatus("Scanning…");
 
       // persist selection
       const store = await storePromise;
-      await store.set("library_dir", picked);
+      await store.set(KEY_LIBRARY_DIR, picked);
       await store.save();
 
       const found = await invoke<Track[]>("scan_music_folder", { dir: picked });
-
-      async function loadLibrary(dir: string) {
-          setFolder(dir);
-          setStatus("Scanning…");
-          setAllTracks([]);
-          setPlaylist("(all)");
-          setQuery("");
-
-          try {
-            const found: Track[] = await invoke("scan_music_folder", { dir });
-            setAllTracks(found);
-            setStatus(`Found ${found.length} tracks`);
-          } catch (e) {
-            setStatus(`Scan failed: ${String(e)}`);
-          }
-        }
-
-        useEffect(() => {
-          (async () => {
-            try {
-              const saved = (await settingsStore.get(STORE_KEY)) as string | null;
-              if (saved && typeof saved === "string" && saved.length > 0) {
-                await loadLibrary(saved);
-              }
-            } catch (e) {
-              setStatus(`Auto-load failed: ${String(e)}`);
-            }
-          })();
-        }, []);
 
       setAllTracks(found);
       setPlaylist("(all)");
@@ -160,13 +250,20 @@ export default function App() {
     const url = downloadUrl.trim();
     if (!url || dlBusy) return;
 
+    // Never download "somewhere": without a Music root there is no playlist to land in.
+    const lib = folderRef.current || "";
+    if (!lib) {
+      setDlLogs("[error] Pick your Music folder first (Import) — downloads land in a playlist folder under it.\n");
+      return;
+    }
+
     setDlBusy(true);
     setDlLogs("");
 
     try {
-      // pass the current selected library folder to Rust
-      const lib = folderRef.current || "";
-      await invoke("ytdlp_download_audio", { args: { url, libraryDir: lib || null } });
+      await invoke("ytdlp_download_audio", {
+        args: { url, libraryDir: lib, targetFolder: dlTarget },
+      });
     } catch (err) {
       setDlBusy(false);
       setDlLogs((prev) => prev + `\n[error] ${String(err)}\n`);
@@ -182,7 +279,7 @@ export default function App() {
     audio.load();
 
     setCurrentPath(t.path);
-    setCurrentName(t.name);
+    setCurrentName(displayName(t.name));
     setCurrentPlaylist(t.playlist || "(root)");
 
     audio.onloadedmetadata = () => {
@@ -190,6 +287,41 @@ export default function App() {
       setProgress(0);
       audio.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
     };
+  }
+
+  // Move the track that is playing into another playlist folder, without stopping it.
+  async function moveCurrentTo(target: string) {
+    const lib = folderRef.current;
+    const fromPath = currentPath;
+    if (!fromPath || !lib || !target) return;
+
+    try {
+      const moved = await invoke<Track>("move_track", {
+        args: { path: fromPath, libraryDir: lib, targetFolder: target },
+      });
+
+      setAllTracks((prev) => prev.map((t) => (t.path === fromPath ? moved : t)));
+      setCurrentPath(moved.path);
+      setCurrentPlaylist(moved.playlist);
+      setStatus(`Moved to ${moved.playlist}`);
+
+      // Re-point the player at the new path, keeping the position.
+      const audio = audioRef.current;
+      if (audio) {
+        const pos = audio.currentTime;
+        const wasPlaying = !audio.paused;
+        audio.src = convertFileSrc(moved.path);
+        audio.load();
+        audio.onloadedmetadata = () => {
+          setDuration(audio.duration || 0);
+          audio.currentTime = pos;
+          setProgress(pos);
+          if (wasPlaying) audio.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
+        };
+      }
+    } catch (err) {
+      setStatus(`Move failed: ${String(err)}`);
+    }
   }
 
   function togglePlay() {
@@ -219,7 +351,15 @@ export default function App() {
     (async () => {
       try {
         const store = await storePromise;
-        const saved = await store.get<string>("library_dir");
+
+        const savedTarget = await store.get<string>(KEY_DOWNLOAD_TARGET);
+        if (savedTarget && typeof savedTarget === "string") setDlTarget(savedTarget);
+
+        const savedVolume = await store.get<number>(KEY_VOLUME);
+        if (typeof savedVolume === "number" && savedVolume >= 0 && savedVolume <= 1) setVolume(savedVolume);
+        settingsLoadedRef.current = true;
+
+        const saved = await store.get<string>(KEY_LIBRARY_DIR);
         if (!saved || typeof saved !== "string") return;
 
         setFolder(saved);
@@ -395,6 +535,57 @@ export default function App() {
           border-color: rgba(0,255,191,0.45);
           box-shadow: 0 0 0 3px rgba(0,255,191,0.08);
         }
+        .targetLabel{ color: var(--textDim); font-size: 13px; white-space: nowrap; }
+        .targetNew{ width: 220px; flex: none; }
+
+        /* In-app dropdown */
+        .dd{ position: relative; }
+        .ddBtn{
+          display:flex; align-items:center; gap: 8px;
+          border: 1px solid var(--border);
+          background: rgba(0,0,0,0.25);
+          color: var(--text);
+          padding: 10px 12px;
+          border-radius: 14px;
+          cursor: pointer;
+          max-width: 260px;
+          font: inherit;
+        }
+        .ddBtn.open, .ddBtn:focus{
+          border-color: rgba(0,255,191,0.45);
+          box-shadow: 0 0 0 3px rgba(0,255,191,0.08);
+          outline: none;
+        }
+        .ddLabel{ overflow:hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ddChevron{ color: var(--textDim); font-size: 12px; }
+        .ddMenu{
+          position: absolute; z-index: 50;
+          top: calc(100% + 6px); left: 0;
+          min-width: 100%; width: max-content; max-width: 340px;
+          max-height: 340px; overflow: auto;
+          padding: 6px;
+          border-radius: 14px;
+          border: 1px solid var(--border);
+          background: #1a1a1a;
+          box-shadow: 0 14px 40px rgba(0,0,0,0.65);
+        }
+        .ddMenu.up{ top: auto; bottom: calc(100% + 6px); }
+        .ddItem{
+          padding: 8px 10px;
+          border-radius: 10px;
+          cursor: pointer;
+          color: var(--text);
+          white-space: nowrap;
+          border: 1px solid transparent;
+        }
+        .ddItem:hover{ background: rgba(255,255,255,0.06); }
+        .ddItem.active{ border-color: rgba(0,255,191,0.35); background: rgba(0,255,191,0.10); }
+        .ddExtra{ color: var(--accent); margin-top: 4px; }
+        .ddSmall{ margin-top: 6px; }
+        .ddSmall .ddBtn{ padding: 5px 10px; font-size: 12px; border-radius: 10px; color: var(--textDim); }
+
+        .volume{ display:flex; align-items:center; gap: 6px; }
+        .volRange{ width: 90px; }
         .downloadLogs{
           margin: 0 16px 12px 16px;
           border: 1px solid var(--border);
@@ -431,17 +622,23 @@ export default function App() {
           border-radius: 18px;
           overflow:hidden;
           min-height:0;
+          display:flex;
+          flex-direction:column;
         }
         .panelHeader{
+          flex:none;
           padding:12px 14px;
           font-weight:700;
           border-bottom:1px solid var(--border);
           background: rgba(255,255,255,0.03);
         }
+        /* The list takes whatever height is left AFTER the header/search row —
+           sizing it to the whole panel hid the last item under the panel edge. */
         .list{
+          flex:1;
+          min-height:0;
           padding:10px;
           overflow:auto;
-          max-height:100%;
         }
         .pill{
           padding:10px 12px;
@@ -457,6 +654,7 @@ export default function App() {
           background: rgba(0,255,191,0.10);
         }
         .searchRow{
+          flex:none;
           padding: 10px;
           border-bottom:1px solid var(--border);
           display:flex;
@@ -494,19 +692,25 @@ export default function App() {
           align-items:center;
           justify-content:space-between;
           gap: 16px;
+          flex-wrap: wrap;
         }
+        /* Now-playing never grows with the title: fixed share of the bar, one line, ellipsis. */
         .nowPlaying{
           display:flex;
           flex-direction:column;
           gap: 2px;
-          min-width: 260px;
+          flex: 0 1 280px;
+          min-width: 180px;
+          max-width: 34%;
+          overflow: hidden;
         }
-        .npTitle{ font-weight:800; }
-        .npSub{ color: var(--textDim); font-size: 12px; }
+        .npTitle{ font-weight:800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .npSub{ color: var(--textDim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .controls{
           display:flex;
           align-items:center;
           gap: 10px;
+          flex: none;
         }
         .circle{
           width: 44px;
@@ -519,22 +723,30 @@ export default function App() {
           place-items:center;
           cursor:pointer;
         }
+        /* The timeline always keeps a usable width; it never gets crushed by its neighbours. */
         .timeline{
-          flex:1;
+          flex: 1 1 260px;
+          min-width: 260px;
           display:flex;
           align-items:center;
           gap: 10px;
         }
-        .time{ color: var(--textDim); font-size: 12px; min-width: 44px; text-align:center; }
-        .range{ width: 100%; }
+        .time{ color: var(--textDim); font-size: 12px; min-width: 44px; text-align:center; flex:none; }
+        .range{ width: 100%; min-width: 0; }
         .rightInfo{
           display:flex;
           align-items:center;
           gap: 10px;
           color: var(--textDim);
           font-size: 12px;
-          min-width: 140px;
+          flex: none;
+          white-space: nowrap;
           justify-content:flex-end;
+        }
+        /* Narrow window: the timeline takes a full second row under the other controls. */
+        @media (max-width: 980px){
+          .timeline{ order: 10; flex: 1 1 100%; min-width: 0; }
+          .nowPlaying{ max-width: 46%; }
         }
         /* Scrollbars */
         * {
@@ -579,6 +791,36 @@ export default function App() {
             if (e.key === "Enter") startManualDownload();
           }}
         />
+        <span className="targetLabel">into</span>
+        {newFolderMode ? (
+          <>
+            <input
+              className="downloadInput targetNew"
+              placeholder="New playlist folder…"
+              autoFocus
+              value={newFolderName}
+              onChange={(e) => setNewFolderName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") chooseTarget(newFolderName);
+                if (e.key === "Escape") setNewFolderMode(false);
+              }}
+            />
+            <button className="btn" onClick={() => chooseTarget(newFolderName)} disabled={!newFolderName.trim()}>
+              OK
+            </button>
+          </>
+        ) : (
+          <Dropdown
+            value={dlTarget}
+            options={targetOptions}
+            title="Playlist folder the download lands in"
+            extra={{ label: "+ New folder…", value: NEW_FOLDER_SENTINEL }}
+            onSelect={(v) => {
+              if (v === NEW_FOLDER_SENTINEL) setNewFolderMode(true);
+              else chooseTarget(v);
+            }}
+          />
+        )}
         <button className="btn" onClick={startManualDownload} disabled={dlBusy || !downloadUrl.trim()}>
           {dlBusy ? "Downloading…" : "Download"}
         </button>
@@ -629,7 +871,7 @@ export default function App() {
                 className={`trackRow ${t.path === currentPath ? "active" : ""}`}
                 onClick={() => loadAndPlay(t)}
               >
-                {t.name}
+                {displayName(t.name)}
               </div>
             ))}
           </div>
@@ -640,8 +882,19 @@ export default function App() {
         <div className="nowPlaying">
           <div className="npTitle">{currentName || "Nothing playing"}</div>
           <div className="npSub">
-            {currentPlaylist ? `All playlists • ${allTracks.length} tracks` : `All playlists • ${allTracks.length} tracks`}
+            {currentPlaylist ? `${currentPlaylist} • ${allTracks.length} tracks` : `All playlists • ${allTracks.length} tracks`}
           </div>
+          {currentPath ? (
+            <Dropdown
+              className="ddSmall"
+              up
+              value=""
+              placeholder="Move to…"
+              title="Move this track to another playlist folder"
+              options={targetOptions.filter((name) => name !== currentPlaylist)}
+              onSelect={moveCurrentTo}
+            />
+          ) : null}
         </div>
 
         <div className="controls">
@@ -671,6 +924,19 @@ export default function App() {
         </div>
 
         <div className="rightInfo">
+          <div className="volume" title={`Volume ${Math.round(volume * 100)}%`}>
+            <span>{volume === 0 ? "🔇" : volume < 0.5 ? "🔉" : "🔊"}</span>
+            <input
+              className="range volRange"
+              type="range"
+              min={0}
+              max={1}
+              step={0.02}
+              value={volume}
+              onChange={(e) => setVolume(Number(e.target.value))}
+            />
+          </div>
+          <div style={{ opacity: 0.35 }}>•</div>
           <div>{shuffle ? "Shuffle on" : "Shuffle off"}</div>
           <div style={{ opacity: 0.35 }}>•</div>
           <div>{currentIndex >= 0 ? `${currentIndex + 1}/${shownCount}` : `0/${shownCount}`}</div>
