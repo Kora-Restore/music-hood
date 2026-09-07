@@ -14,11 +14,15 @@ type Track = {
   duration_secs: number;
 };
 
-// "Schrotthagen, Giovanni Berg" / "A & B" / "A feat. B" → the individual names.
+const UNTAGGED = "(untagged)";
+
+// "Schrotthagen, Giovanni Berg" / "A feat. B" → the individual names. Mirrors the Rust side:
+// no splitting on "&" or "x", so "Earth, Wind & Fire" survives as "Earth" + "Wind & Fire" at worst.
+// A track with no artist at all lands in the "(untagged)" bucket so it stays reachable.
 function splitArtists(artist: string): string[] {
-  if (!artist) return [];
+  if (!artist) return [UNTAGGED];
   return artist
-    .split(/\s*(?:,|\/|&|;|\bfeat\.?\b|\bft\.?\b|\bx\b|\bvs\.?\b)\s*/i)
+    .split(/\s*(?:,|\/|;|\bfeat\.?\s|\bft\.?\s)\s*/i)
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
 }
@@ -32,6 +36,37 @@ const DEFAULT_DOWNLOAD_TARGET = "Downloads";
 const NEW_FOLDER_SENTINEL = "__new__";
 
 const KEY_VOLUME = "volume";
+
+// Shuffle icon: two straight parallel arrows when off, crossing arrows when on.
+function ShuffleIcon({ on }: { on: boolean }) {
+  const s = { fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" } as const;
+  return on ? (
+    <svg width="20" height="20" viewBox="0 0 24 24" {...s} aria-hidden="true">
+      <path d="M3 7h3.5c1.6 0 3 .8 3.9 2.1L14.6 15c.9 1.3 2.3 2.1 3.9 2.1H21" />
+      <path d="M3 17h3.5c1.6 0 3-.8 3.9-2.1l4.2-5.9C15.5 7.8 16.9 7 18.5 7H21" />
+      <path d="M18.5 4.5L21 7l-2.5 2.5" />
+      <path d="M18.5 14.6L21 17.1l-2.5 2.5" />
+    </svg>
+  ) : (
+    <svg width="20" height="20" viewBox="0 0 24 24" {...s} aria-hidden="true">
+      <path d="M3 8h18" />
+      <path d="M3 16h18" />
+      <path d="M18.5 5.5L21 8l-2.5 2.5" />
+      <path d="M18.5 13.5L21 16l-2.5 2.5" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 7h16" />
+      <path d="M10 11v6M14 11v6" />
+      <path d="M6 7l1 13h10l1-13" />
+      <path d="M9 7V4h6v3" />
+    </svg>
+  );
+}
 
 // Filename without extension — what the user should read as the title.
 function displayName(fileName: string) {
@@ -134,11 +169,14 @@ export default function App() {
   const [sideTab, setSideTab] = useState<"playlists" | "artists">("playlists");
   const [artistView, setArtistView] = useState<string>("");
   const [artistQuery, setArtistQuery] = useState<string>("");
+  const [playlistQuery, setPlaylistQuery] = useState<string>("");
   const [query, setQuery] = useState<string>("");
 
   const [currentPath, setCurrentPath] = useState<string>("");
   // Single click selects (highlight only); double click plays. Selection is what "Move selected" acts on.
   const [selectedPath, setSelectedPath] = useState<string>("");
+  // Track awaiting delete confirmation (the in-app "are you sure" box).
+  const [confirmDelete, setConfirmDelete] = useState<Track | null>(null);
   const [currentName, setCurrentName] = useState<string>("");
   const [currentPlaylist, setCurrentPlaylist] = useState<string>("");
 
@@ -224,8 +262,17 @@ export default function App() {
     }
     return Array.from(counts.entries())
       .map(([name, count]) => ({ name, count }))
-      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+      .sort((a, b) => {
+        if (a.name === UNTAGGED) return 1; // always last
+        if (b.name === UNTAGGED) return -1;
+        return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+      });
   }, [allTracks]);
+
+  const shownPlaylists = useMemo(() => {
+    const q = playlistQuery.trim().toLowerCase();
+    return q ? playlists.filter((p) => p === "(all)" || p.toLowerCase().includes(q)) : playlists;
+  }, [playlists, playlistQuery]);
 
   const shownArtists = useMemo(() => {
     const q = artistQuery.trim().toLowerCase();
@@ -363,7 +410,9 @@ export default function App() {
         args: { path: fromPath, libraryDir: lib, targetFolder: target },
       });
 
-      setAllTracks((prev) => prev.map((t) => (t.path === fromPath ? moved : t)));
+      setAllTracks((prev) =>
+        prev.map((t) => (t.path === fromPath ? { ...moved, artist: moved.artist || t.artist } : t))
+      );
       if (selectedPath === fromPath) setSelectedPath(moved.path);
       setStatus(`Moved "${displayName(moved.name)}" to ${moved.playlist}`);
 
@@ -390,6 +439,46 @@ export default function App() {
       setStatus(`Move failed: ${String(err)}`);
     }
   }
+
+  // Send a track to the Recycle Bin (after the confirmation box). Stops it if it was playing.
+  async function deleteTrack(t: Track) {
+    const lib = folderRef.current;
+    if (!lib) return;
+    try {
+      await invoke("delete_track", { args: { path: t.path, libraryDir: lib } });
+      if (t.path === currentPath) {
+        const audio = audioRef.current;
+        if (audio) {
+          audio.pause();
+          audio.removeAttribute("src");
+          audio.load();
+        }
+        setIsPlaying(false);
+        setCurrentPath("");
+        setCurrentName("");
+        setCurrentPlaylist("");
+        setProgress(0);
+        setDuration(0);
+      }
+      if (t.path === selectedPath) setSelectedPath("");
+      setAllTracks((prev) => prev.filter((x) => x.path !== t.path));
+      setStatus(`Moved "${displayName(t.name)}" to the Recycle Bin`);
+    } catch (err) {
+      setStatus(`Delete failed: ${String(err)}`);
+    } finally {
+      setConfirmDelete(null);
+    }
+  }
+
+  // Escape closes the confirmation box.
+  useEffect(() => {
+    if (!confirmDelete) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setConfirmDelete(null);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [confirmDelete]);
 
   function togglePlay() {
     const audio = audioRef.current;
@@ -637,6 +726,7 @@ export default function App() {
           box-shadow: 0 14px 40px rgba(0,0,0,0.65);
         }
         .ddMenu.up{ top: auto; bottom: calc(100% + 6px); }
+        .player{ position: relative; z-index: 5; }  /* popups from the bar float above the panels */
         .ddItem{
           padding: 8px 10px;
           border-radius: 10px;
@@ -651,6 +741,56 @@ export default function App() {
         .ddSmall{ margin-top: 6px; }
         .ddSmall .ddBtn{ padding: 5px 10px; font-size: 12px; border-radius: 10px; color: var(--textDim); }
 
+        .shuffleBtn{
+          display:grid; place-items:center;
+          width: 38px; height: 38px;
+          border-radius: 12px;
+          border: 1px solid var(--border);
+          background: rgba(255,255,255,0.04);
+          color: rgba(255,255,255,0.45);
+          cursor: pointer;
+          transition: color .15s, border-color .15s, background .15s, transform .1s;
+        }
+        .shuffleBtn:hover{ color: var(--text); background: rgba(255,255,255,0.08); }
+        .shuffleBtn:active{ transform: scale(0.94); }
+        .shuffleBtn.on{
+          color: var(--accent);
+          border-color: rgba(0,255,191,0.45);
+          background: rgba(0,255,191,0.10);
+          box-shadow: 0 0 0 3px rgba(0,255,191,0.08);
+        }
+        .iconBtn{
+          display:grid; place-items:center;
+          width: 40px; height: 40px; flex:none;
+          border-radius: 12px;
+          border: 1px solid var(--border);
+          background: rgba(255,255,255,0.04);
+          color: var(--textDim);
+          cursor: pointer;
+        }
+        .iconBtn:hover{ color: var(--text); background: rgba(255,255,255,0.08); }
+        .iconBtn.danger:hover{ color: #ff5c7a; border-color: rgba(255,92,122,0.45); background: rgba(255,92,122,0.10); }
+
+        /* Confirmation box */
+        .modalBackdrop{
+          position: fixed; inset: 0; z-index: 100;
+          background: rgba(0,0,0,0.55);
+          display:grid; place-items:center;
+        }
+        .modal{
+          width: min(440px, 90vw);
+          border: 1px solid var(--border);
+          border-radius: 18px;
+          background: #181818;
+          box-shadow: 0 24px 60px rgba(0,0,0,0.7);
+          padding: 18px;
+        }
+        .modalTitle{ font-weight: 800; font-size: 16px; margin-bottom: 10px; }
+        .modalTrack{ font-weight: 700; word-break: break-word; }
+        .modalHint{ color: var(--textDim); font-size: 12px; margin-top: 6px; }
+        .modalActions{ display:flex; justify-content:flex-end; gap: 10px; margin-top: 18px; }
+        .dangerBtn{ border-color: rgba(255,92,122,0.45); background: rgba(255,92,122,0.12); color: #ff8aa0; }
+        .dangerBtn:hover{ background: rgba(255,92,122,0.22); }
         .volume{ display:flex; align-items:center; gap: 6px; }
         .volRange{ width: 90px; }
         .downloadLogs{
@@ -794,9 +934,9 @@ export default function App() {
           flex: 0 1 280px;
           min-width: 180px;
           max-width: 34%;
-          overflow: hidden;
+          /* no overflow:hidden here — it would clip the "Move to…" popup; the children clip themselves */
         }
-        .npTitle{ font-weight:800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .npTitle{ font-weight:800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
         .npSub{ color: var(--textDim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .controls{
           display:flex;
@@ -950,8 +1090,17 @@ export default function App() {
           </div>
 
           {sideTab === "playlists" ? (
+            <>
+              <div className="searchRow">
+                <input
+                  className="search"
+                  placeholder="Filter playlists…"
+                  value={playlistQuery}
+                  onChange={(e) => setPlaylistQuery(e.target.value)}
+                />
+              </div>
             <div className="list">
-              {playlists.map((p) => (
+              {shownPlaylists.map((p) => (
                 <div
                   key={p}
                   className={`pill ${!artistView && p === playlist ? "active" : ""}`}
@@ -964,6 +1113,7 @@ export default function App() {
                 </div>
               ))}
             </div>
+            </>
           ) : (
             <>
               <div className="searchRow">
@@ -1018,8 +1168,22 @@ export default function App() {
                 onSelect={(target) => moveTrackTo(selectedTrack.path, target)}
               />
             ) : null}
-            <button className="btn" onClick={() => setShuffle((s) => !s)}>
-              {shuffle ? "Shuffle: on" : "Shuffle: off"}
+            {selectedTrack ? (
+              <button
+                className="iconBtn danger"
+                title={`Delete "${displayName(selectedTrack.name)}" (to the Recycle Bin)`}
+                onClick={() => setConfirmDelete(selectedTrack)}
+              >
+                <TrashIcon />
+              </button>
+            ) : null}
+            <button
+              className={`shuffleBtn ${shuffle ? "on" : ""}`}
+              onClick={() => setShuffle((s) => !s)}
+              title={shuffle ? "Shuffle is on — click to play in order" : "Shuffle is off — click to shuffle"}
+              aria-pressed={shuffle}
+            >
+              <ShuffleIcon on={shuffle} />
             </button>
           </div>
           <div className="list">
@@ -1099,13 +1263,38 @@ export default function App() {
             />
           </div>
           <div style={{ opacity: 0.35 }}>•</div>
-          <div>{shuffle ? "Shuffle on" : "Shuffle off"}</div>
+          <button
+            className={`shuffleBtn ${shuffle ? "on" : ""}`}
+            onClick={() => setShuffle((s) => !s)}
+            title={shuffle ? "Shuffle is on — click to play in order" : "Shuffle is off — click to shuffle"}
+            aria-pressed={shuffle}
+          >
+            <ShuffleIcon on={shuffle} />
+          </button>
           <div style={{ opacity: 0.35 }}>•</div>
           <div>{currentIndex >= 0 ? `${currentIndex + 1}/${shownCount}` : `0/${shownCount}`}</div>
         </div>
 
         <audio ref={audioRef} preload="metadata" />
       </div>
+
+      {confirmDelete ? (
+        <div className="modalBackdrop" onMouseDown={() => setConfirmDelete(null)}>
+          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="modalTitle">Delete this track?</div>
+            <div className="modalBody">
+              <div className="modalTrack">{displayName(confirmDelete.name)}</div>
+              <div className="modalHint">
+                {confirmDelete.playlist} · the file goes to the Windows Recycle Bin, so this can be undone from there.
+              </div>
+            </div>
+            <div className="modalActions">
+              <button className="btn" onClick={() => setConfirmDelete(null)} autoFocus>Cancel</button>
+              <button className="btn dangerBtn" onClick={() => deleteTrack(confirmDelete)}>Delete</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

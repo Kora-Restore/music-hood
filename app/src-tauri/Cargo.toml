@@ -33,3 +33,5 @@ tauri-plugin-shell = "2"
 # tag reading (title/artist/duration) for the library scan; rayon parallelises it
 lofty = "0.22"
 rayon = "1"
+# delete = move to the Recycle Bin, never a hard delete
+trash = "5"

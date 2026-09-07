@@ -37,13 +37,49 @@ fn read_tags(path: &Path) -> (String, String, u64) {
   (title, artist, secs)
 }
 
-/// "Song - Artist.m4a" → "Artist" (library convention); "" when the name has no " - ".
-fn artist_from_filename(name: &str) -> String {
-  let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
-  match stem.rsplit_once(" - ") {
-    Some((_, artist)) if !artist.trim().is_empty() => artist.trim().to_string(),
-    _ => String::new(),
+/// Individual names inside a tag's artist string: "A, B / C feat. D" → [A, B, C, D].
+/// Deliberately does NOT split on "&" or "x" ("Earth, Wind & Fire" stays one name after the comma split).
+fn split_artists(artist: &str) -> Vec<String> {
+  let mut out = Vec::new();
+  for part in artist.split(|c| c == ',' || c == '/' || c == ';') {
+    let mut piece = part.trim().to_string();
+    // strip a trailing " feat. X" / " ft. X" and keep X as its own name
+    let lower = piece.to_lowercase();
+    for marker in [" feat. ", " feat ", " ft. ", " ft "] {
+      if let Some(i) = lower.find(marker) {
+        let (main, featured) = piece.split_at(i);
+        let featured = featured[marker.len()..].trim().to_string();
+        piece = main.trim().to_string();
+        if !featured.is_empty() {
+          out.push(featured);
+        }
+        break;
+      }
+    }
+    if !piece.is_empty() {
+      out.push(piece);
+    }
   }
+  out
+}
+
+/// For a file WITHOUT an artist tag: derive the artist from the filename, but only accept a
+/// name that already exists as a tagged artist elsewhere in the library ("Song - Artist" or
+/// "Artist - Song"). Anything else stays "" — better an "(untagged)" bucket than an invented artist.
+fn artist_from_filename(name: &str, known: &std::collections::HashSet<String>) -> String {
+  let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+  let Some((left, right)) = stem.rsplit_once(" - ") else {
+    return String::new();
+  };
+  for candidate in [right.trim(), left.trim()] {
+    if candidate.is_empty() {
+      continue;
+    }
+    if known.contains(&candidate.to_lowercase()) {
+      return candidate.to_string();
+    }
+  }
+  String::new()
 }
 
 fn is_audio_file(path: &Path) -> bool {
@@ -122,9 +158,21 @@ fn scan_music_folder(dir: String) -> Result<Vec<Track>, String> {
   tracks.par_iter_mut().for_each(|t| {
     let (title, artist, secs) = read_tags(Path::new(&t.path));
     t.title = title;
-    t.artist = if artist.is_empty() { artist_from_filename(&t.name) } else { artist };
+    t.artist = artist;
     t.duration_secs = secs;
   });
+
+  // Untagged files: fall back to the filename only when it names an artist the tags already know.
+  let known: std::collections::HashSet<String> = tracks
+    .iter()
+    .flat_map(|t| split_artists(&t.artist))
+    .map(|a| a.to_lowercase())
+    .collect();
+  for t in tracks.iter_mut() {
+    if t.artist.is_empty() {
+      t.artist = artist_from_filename(&t.name, &known);
+    }
+  }
 
   tracks.sort_by(|a, b| a.playlist.cmp(&b.playlist).then(a.name.cmp(&b.name)));
   Ok(tracks)
@@ -190,14 +238,38 @@ fn move_track(args: MoveArgs) -> Result<Track, String> {
 
   let name = file_name.to_string_lossy().to_string();
   let (title, artist, secs) = read_tags(&dest);
+  // (untagged files keep the artist the UI already had for them — the frontend patches this in)
   Ok(Track {
     path: dest.to_string_lossy().to_string(),
     playlist: target,
-    artist: if artist.is_empty() { artist_from_filename(&name) } else { artist },
     name,
     title,
+    artist,
     duration_secs: secs,
   })
+}
+
+// ---------- delete a track (to the Recycle Bin) ----------
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DeleteArgs {
+  path: String,
+  #[serde(alias = "libraryDir")]
+  library_dir: String,
+}
+
+/// Sends one file inside the library root to the Recycle Bin. Never a hard delete.
+#[tauri::command]
+fn delete_track(args: DeleteArgs) -> Result<(), String> {
+  let root = PathBuf::from(args.library_dir.trim());
+  let src = PathBuf::from(&args.path);
+  if !src.is_file() {
+    return Err(format!("File not found: {}", src.display()));
+  }
+  if !src.starts_with(&root) {
+    return Err("Track is outside the Music folder".into());
+  }
+  trash::delete(&src).map_err(|e| format!("Could not move to Recycle Bin: {e}"))
 }
 
 fn find_bin_by_prefix(dir: &Path, prefix: &str) -> Option<PathBuf> {
@@ -338,7 +410,7 @@ pub fn run() {
     .plugin(tauri_plugin_dialog::init())
     .plugin(tauri_plugin_shell::init())
     .plugin(tauri_plugin_store::Builder::default().build())
-    .invoke_handler(tauri::generate_handler![scan_music_folder, ytdlp_download_audio, move_track])
+    .invoke_handler(tauri::generate_handler![scan_music_folder, ytdlp_download_audio, move_track, delete_track])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }
