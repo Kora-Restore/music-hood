@@ -1,13 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Store } from "@tauri-apps/plugin-store";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { readDir } from "@tauri-apps/plugin-fs";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+const settingsStore = new Store("music-hood.json");
+const STORE_KEY = "libraryDir";
 
 type Track = {
-  path: string;          // absolute path
-  name: string;          // filename
-  playlist: string;      // first folder level (or "(root)")
+  path: string;
+  name: string;
+  playlist: string;
 };
+
+const storePromise = Store.load("music-hood.json");
 
 const COLORS = {
   bg0: "#0f0f0f",
@@ -16,47 +23,19 @@ const COLORS = {
   accent2: "#8c19ff",
   text: "rgba(255,255,255,0.92)",
   textDim: "rgba(255,255,255,0.65)",
-  panel: "rgba(255,255,255,0.06)",
-  panel2: "rgba(255,255,255,0.04)",
+  panel: "rgba(255,255,255,0.05)",
   border: "rgba(255,255,255,0.10)",
 };
 
-function isAudioFile(filename: string) {
-  const f = filename.toLowerCase();
-  return (
-    f.endsWith(".mp3") ||
-    f.endsWith(".m4a") ||
-    f.endsWith(".aac") ||
-    f.endsWith(".wav") ||
-    f.endsWith(".ogg") ||
-    f.endsWith(".flac")
-  );
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function joinPath(base: string, name: string) {
-  // Preserve Windows-style separators if base looks like Windows
-  const isWindows = base.includes("\\") || /^[A-Za-z]:\\/.test(base);
-  const sep = isWindows ? "\\" : "/";
-  if (base.endsWith(sep)) return base + name;
-  return base + sep + name;
-}
-
-function getRelativeFirstFolder(root: string, abs: string) {
-  // Very defensive: handles Windows + unicode + spaces
-  const normRoot = root.replace(/\//g, "\\");
-  const normAbs = abs.replace(/\//g, "\\");
-  if (!normAbs.toLowerCase().startsWith(normRoot.toLowerCase())) return "(unknown)";
-
-  const rel = normAbs.slice(normRoot.length).replace(/^\\+/, "");
-  if (!rel) return "(root)";
-
-  const first = rel.split("\\")[0];
-  return first?.trim() ? first : "(root)";
-}
-
-function formatDisplayName(filename: string) {
-  // Keep your raw filenames, but make them less “filesystem” when displayed
-  return filename.replace(/\.(mp3|m4a|aac|wav|ogg|flac)$/i, "");
+function formatTime(sec: number) {
+  if (!isFinite(sec) || sec < 0) return "0:00";
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
 }
 
 export default function App() {
@@ -74,190 +53,189 @@ export default function App() {
   const [currentPlaylist, setCurrentPlaylist] = useState<string>("");
 
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const [progress, setProgress] = useState<number>(0);
+  const [duration, setDuration] = useState<number>(0);
   const [shuffle, setShuffle] = useState<boolean>(false);
 
-  const [progress, setProgress] = useState<number>(0); // seconds
-  const [duration, setDuration] = useState<number>(0); // seconds
+  // Manual download box
+  const [downloadUrl, setDownloadUrl] = useState<string>("");
+  const [dlBusy, setDlBusy] = useState<boolean>(false);
+  const [dlLogs, setDlLogs] = useState<string>("");
 
-  // playlists from first folder level (no nesting for now)
+  // IMPORTANT: avoid duplicate ytdlp listeners in dev/hmr by using a ref for latest folder
+  const folderRef = useRef<string>("");
+  useEffect(() => {
+    folderRef.current = folder;
+  }, [folder]);
+
   const playlists = useMemo(() => {
     const set = new Set<string>();
-    for (const t of allTracks) set.add(t.playlist);
-    const list = Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
-    // keep "(root)" near the top but after (all) if present
-    const rootIdx = list.indexOf("(root)");
-    if (rootIdx > -1) {
-      list.splice(rootIdx, 1);
-      list.unshift("(root)");
-    }
-    return ["(all)", ...list];
+    for (const t of allTracks) set.add(t.playlist || "(root)");
+    const arr = Array.from(set);
+    arr.sort((a, b) => a.localeCompare(b));
+    return ["(all)", ...arr.filter((x) => x !== "(all)")];
   }, [allTracks]);
 
   const filteredTracks = useMemo(() => {
     const q = query.trim().toLowerCase();
-
     return allTracks.filter((t) => {
-      if (playlist !== "(all)" && t.playlist !== playlist) return false;
+      if (playlist !== "(all)" && (t.playlist || "(root)") !== playlist) return false;
       if (!q) return true;
-      return (
-        t.name.toLowerCase().includes(q) ||
-        t.playlist.toLowerCase().includes(q)
-      );
+      return t.name.toLowerCase().includes(q);
     });
   }, [allTracks, playlist, query]);
 
-  // Pick a "current index" based on filtered list
+  const shownCount = filteredTracks.length;
+
   const currentIndex = useMemo(() => {
     if (!currentPath) return -1;
     return filteredTracks.findIndex((t) => t.path === currentPath);
   }, [filteredTracks, currentPath]);
 
-  function pickRandomIndex(excluding?: number) {
+  function pickNextIndex(delta: number) {
     const n = filteredTracks.length;
-    if (n <= 0) return -1;
-    if (n === 1) return 0;
-    let idx = Math.floor(Math.random() * n);
-    if (typeof excluding === "number" && excluding >= 0) {
-      while (idx === excluding) idx = Math.floor(Math.random() * n);
-    }
-    return idx;
+    if (n === 0) return -1;
+    if (shuffle) return Math.floor(Math.random() * n);
+    const base = currentIndex >= 0 ? currentIndex : 0;
+    return (base + delta + n) % n;
   }
 
   async function importFolder() {
     try {
-      const selected = await open({ directory: true, multiple: false });
-      if (!selected || typeof selected !== "string") return;
+      const picked = await open({ directory: true, multiple: false });
+      if (!picked || typeof picked !== "string") return;
+      
+      await settingsStore.set(STORE_KEY, picked);
+      await settingsStore.save();
 
-      setFolder(selected);
+      setFolder(picked);
       setStatus("Scanning…");
-      setAllTracks([]);
-      setPlaylist("(all)");
-      setQuery("");
 
-      const found: Track[] = [];
+      // persist selection
+      const store = await storePromise;
+      await store.set("library_dir", picked);
+      await store.save();
 
-      async function scan(dir: string) {
-        const entries: any[] = (await readDir(dir)) as any[];
+      const found = await invoke<Track[]>("scan_music_folder", { dir: picked });
 
-        for (const e of entries) {
-          // plugin-fs readDir entries often look like:
-          // { name, isDirectory, isFile, isSymlink } (no "path")
-          const name = e?.name;
-          if (!name || typeof name !== "string") continue;
+      async function loadLibrary(dir: string) {
+          setFolder(dir);
+          setStatus("Scanning…");
+          setAllTracks([]);
+          setPlaylist("(all)");
+          setQuery("");
 
-          const childPath = joinPath(dir, name);
-
-          if (e?.isDirectory) {
-            await scan(childPath);
-          } else if (e?.isFile) {
-            if (isAudioFile(name)) {
-              const pl = getRelativeFirstFolder(selected, childPath);
-              found.push({ path: childPath, name, playlist: pl });
-            }
+          try {
+            const found: Track[] = await invoke("scan_music_folder", { dir });
+            setAllTracks(found);
+            setStatus(`Found ${found.length} tracks`);
+          } catch (e) {
+            setStatus(`Scan failed: ${String(e)}`);
           }
         }
-      }
 
-      await scan(selected);
-
-      // Sort: playlist then name (stable-ish)
-      found.sort((a, b) => {
-        const p = a.playlist.localeCompare(b.playlist, undefined, { sensitivity: "base" });
-        if (p !== 0) return p;
-        return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
-      });
+        useEffect(() => {
+          (async () => {
+            try {
+              const saved = (await settingsStore.get(STORE_KEY)) as string | null;
+              if (saved && typeof saved === "string" && saved.length > 0) {
+                await loadLibrary(saved);
+              }
+            } catch (e) {
+              setStatus(`Auto-load failed: ${String(e)}`);
+            }
+          })();
+        }, []);
 
       setAllTracks(found);
+      setPlaylist("(all)");
+      setQuery("");
       setStatus(`Found ${found.length} tracks`);
-    } catch (err: any) {
-      setStatus(`Scan error: ${String(err?.message ?? err)}`);
-      console.error(err);
+    } catch (err) {
+      setStatus(`Scan error: ${String(err)}`);
+    }
+  }
+
+  async function startManualDownload() {
+    const url = downloadUrl.trim();
+    if (!url || dlBusy) return;
+
+    setDlBusy(true);
+    setDlLogs("");
+
+    try {
+      // pass the current selected library folder to Rust
+      const lib = folderRef.current || "";
+      await invoke("ytdlp_download_audio", { args: { url, libraryDir: lib || null } });
+    } catch (err) {
+      setDlBusy(false);
+      setDlLogs((prev) => prev + `\n[error] ${String(err)}\n`);
     }
   }
 
   function loadAndPlay(t: Track) {
-    setCurrentPath(t.path);
-    setCurrentName(t.name);
-    setCurrentPlaylist(t.playlist);
-
     const audio = audioRef.current;
     if (!audio) return;
 
-    // IMPORTANT: use Tauri asset URL so the <audio> element can load local files
     const src = convertFileSrc(t.path);
-
-    // Stop the current load cleanly
-    audio.pause();
-    audio.currentTime = 0;
-    setProgress(0);
-    setDuration(0);
-
     audio.src = src;
     audio.load();
 
-    const playPromise = audio.play();
-    if (playPromise && typeof playPromise.catch === "function") {
-      playPromise.catch((e) => {
-        console.warn("audio.play() failed:", e);
-        setIsPlaying(false);
-      });
-    }
+    setCurrentPath(t.path);
+    setCurrentName(t.name);
+    setCurrentPlaylist(t.playlist || "(root)");
+
+    audio.onloadedmetadata = () => {
+      setDuration(audio.duration || 0);
+      setProgress(0);
+      audio.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
+    };
   }
 
-  function togglePlayPause() {
+  function togglePlay() {
     const audio = audioRef.current;
     if (!audio) return;
 
-    if (audio.paused) {
-      const p = audio.play();
-      if (p && typeof p.catch === "function") p.catch(() => setIsPlaying(false));
-    } else {
+    if (isPlaying) {
       audio.pause();
-    }
-  }
-
-  function nextTrack() {
-    if (filteredTracks.length === 0) return;
-
-    const idx = currentIndex;
-    let nextIdx = -1;
-
-    if (shuffle) {
-      nextIdx = pickRandomIndex(idx);
+      setIsPlaying(false);
     } else {
-      nextIdx = idx >= 0 ? (idx + 1) % filteredTracks.length : 0;
+      audio.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
     }
-
-    const t = filteredTracks[nextIdx];
-    if (t) loadAndPlay(t);
   }
 
-  function prevTrack() {
-    if (filteredTracks.length === 0) return;
-
-    const idx = currentIndex;
-    let prevIdx = -1;
-
-    if (shuffle) {
-      prevIdx = pickRandomIndex(idx);
-    } else {
-      prevIdx = idx >= 0 ? (idx - 1 + filteredTracks.length) % filteredTracks.length : 0;
-    }
-
-    const t = filteredTracks[prevIdx];
-    if (t) loadAndPlay(t);
+  function playPrev() {
+    const idx = pickNextIndex(-1);
+    if (idx >= 0) loadAndPlay(filteredTracks[idx]);
   }
 
-  function clamp(n: number, min: number, max: number) {
-    return Math.max(min, Math.min(max, n));
+  function playNext() {
+    const idx = pickNextIndex(1);
+    if (idx >= 0) loadAndPlay(filteredTracks[idx]);
   }
 
-  function formatTime(sec: number) {
-    if (!isFinite(sec) || sec < 0) return "0:00";
-    const m = Math.floor(sec / 60);
-    const s = Math.floor(sec % 60);
-    return `${m}:${String(s).padStart(2, "0")}`;
-  }
+  // Auto-load last imported library on startup
+  useEffect(() => {
+    (async () => {
+      try {
+        const store = await storePromise;
+        const saved = await store.get<string>("library_dir");
+        if (!saved || typeof saved !== "string") return;
+
+        setFolder(saved);
+        setStatus("Scanning…");
+
+        const found = await invoke<Track[]>("scan_music_folder", { dir: saved });
+
+        setAllTracks(found);
+        setPlaylist("(all)");
+        setQuery("");
+        setStatus(`Found ${found.length} tracks`);
+      } catch (err) {
+        setStatus(`Auto-load failed: ${String(err)}`);
+      }
+    })();
+  }, []);
 
   // Keep progress updated
   useEffect(() => {
@@ -265,101 +243,82 @@ export default function App() {
     if (!audio) return;
 
     const onTime = () => setProgress(audio.currentTime || 0);
-    const onMeta = () => setDuration(audio.duration || 0);
-    const onPlay = () => setIsPlaying(true);
-    const onPause = () => setIsPlaying(false);
-    const onEnded = () => nextTrack();
+    const onEnded = () => {
+      setIsPlaying(false);
+      playNext();
+    };
 
     audio.addEventListener("timeupdate", onTime);
-    audio.addEventListener("loadedmetadata", onMeta);
-    audio.addEventListener("durationchange", onMeta);
-    audio.addEventListener("play", onPlay);
-    audio.addEventListener("pause", onPause);
     audio.addEventListener("ended", onEnded);
 
     return () => {
       audio.removeEventListener("timeupdate", onTime);
-      audio.removeEventListener("loadedmetadata", onMeta);
-      audio.removeEventListener("durationchange", onMeta);
-      audio.removeEventListener("play", onPlay);
-      audio.removeEventListener("pause", onPause);
       audio.removeEventListener("ended", onEnded);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentPath, shuffle, playlist, query, filteredTracks.length, currentIndex]);
+  }, [filteredTracks, currentIndex, shuffle]);
 
-  // Spacebar only. No J/K. No legend. Spotify vibe assumes you know the buttons.
+  // yt-dlp listeners (robust against React StrictMode + HMR)
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      // Don’t steal keys while typing
-      const el = document.activeElement;
-      const isTyping =
-        el instanceof HTMLInputElement ||
-        el instanceof HTMLTextAreaElement ||
-        (el instanceof HTMLElement && el.isContentEditable);
+    let active = true;
 
-      if (isTyping) return;
+    let unlistenOut: (() => void) | undefined;
+    let unlistenErr: (() => void) | undefined;
+    let unlistenDone: (() => void) | undefined;
 
-      if (e.code === "Space") {
-        e.preventDefault();
-        togglePlayPause();
-      }
-    };
-
-    window.addEventListener("keydown", onKeyDown, { passive: false });
-    return () => window.removeEventListener("keydown", onKeyDown as any);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Media keys (best effort): Media Session API
-    useEffect(() => {
-    const ms: any = (navigator as any).mediaSession;
-    if (!ms) return;
-
-    const title = currentName ? formatDisplayName(currentName) : "music-hood";
-    const album = currentPlaylist || "";
-
-    const MM: any = (window as any).MediaMetadata;
-    if (typeof MM === "function") {
-      ms.metadata = new MM({
-        title,
-        artist: "",
-        album,
+    const setup = async () => {
+      const uOut = await listen<string>("ytdlp:stdout", (e) => {
+        // add newline if missing, to keep logs readable
+        const chunk = e.payload.endsWith("\n") ? e.payload : e.payload + "\n";
+        setDlLogs((prev) => prev + chunk);
       });
-    } else {
-      // fallback if MediaMetadata isn't available
-      ms.metadata = { title, artist: "", album };
-    }
 
-    try {
-      ms.setActionHandler("play", () => togglePlayPause());
-      ms.setActionHandler("pause", () => togglePlayPause());
-      ms.setActionHandler("previoustrack", () => prevTrack());
-      ms.setActionHandler("nexttrack", () => nextTrack());
-      ms.setActionHandler("seekto", (details: any) => {
-        const audio = audioRef.current;
-        if (!audio) return;
-        if (typeof details?.seekTime === "number") {
-          audio.currentTime = clamp(details.seekTime, 0, audio.duration || 0);
+      const uErr = await listen<string>("ytdlp:stderr", (e) => {
+        const chunk = e.payload.endsWith("\n") ? e.payload : e.payload + "\n";
+        setDlLogs((prev) => prev + chunk);
+      });
+
+      const uDone = await listen<number>("ytdlp:done", async (e) => {
+        setDlBusy(false);
+        setDlLogs((prev) => prev + `\n[done] exit code: ${e.payload}\n`);
+
+        // Refresh library so the new file appears
+        const lib = folderRef.current;
+        if (lib) {
+          try {
+            setStatus("Refreshing…");
+            const found = await invoke<Track[]>("scan_music_folder", { dir: lib });
+            setAllTracks(found);
+            setStatus(`Found ${found.length} tracks`);
+          } catch (err) {
+            setStatus(`Refresh error: ${String(err)}`);
+          }
         }
       });
-    } catch {
-      // Some webviews are picky; ignore.
-    }
 
-    ms.playbackState = isPlaying ? "playing" : "paused";
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentName, currentPlaylist, isPlaying]);
+      // If StrictMode unmounted us before the awaits finished, immediately unlisten.
+      if (!active) {
+        uOut();
+        uErr();
+        uDone();
+        return;
+      }
 
+      unlistenOut = uOut;
+      unlistenErr = uErr;
+      unlistenDone = uDone;
+    };
 
-  const nowPlayingLabel = useMemo(() => {
-    if (!currentName) return "Nothing playing";
-    const n = formatDisplayName(currentName);
-    const p = currentPlaylist ? ` (${currentPlaylist})` : "";
-    return `${n}${p}`;
-  }, [currentName, currentPlaylist]);
+    setup();
 
-  const shownCount = filteredTracks.length;
+    return () => {
+      active = false;
+      unlistenOut?.();
+      unlistenErr?.();
+      unlistenDone?.();
+    };
+  }, []);
+
 
   return (
     <div className="app">
@@ -372,152 +331,59 @@ export default function App() {
           --text:${COLORS.text};
           --textDim:${COLORS.textDim};
           --panel:${COLORS.panel};
-          --panel2:${COLORS.panel2};
           --border:${COLORS.border};
         }
-
         *{ box-sizing:border-box; }
-        html,body{ height:100%; margin:0; background:var(--bg0); color:var(--text); }
-        body{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"; }
-
-        /* Scrollbars: slim, modern, no track blocks, no arrows */
-        *::-webkit-scrollbar{ width:10px; height:10px; }
-        *::-webkit-scrollbar-track{ background:transparent; }
-        *::-webkit-scrollbar-thumb{
-          background: linear-gradient(180deg, rgba(0,255,191,0.55), rgba(140,25,255,0.55));
-          border-radius: 999px;
-          border: 2px solid transparent;
-          background-clip: padding-box;
-        }
-        *::-webkit-scrollbar-corner{ background:transparent; }
-        *::-webkit-scrollbar-button{ width:0; height:0; display:none; }
-
+        body,html,#root{ height:100%; margin:0; background:var(--bg0); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Roboto; }
         .app{
-          height:100vh;
+          height:100%;
           display:flex;
           flex-direction:column;
-          background:
-            radial-gradient(1000px 600px at 20% 0%, rgba(0,255,191,0.12), transparent 60%),
-            radial-gradient(900px 600px at 80% 10%, rgba(140,25,255,0.10), transparent 55%),
-            linear-gradient(180deg, rgba(255,255,255,0.02), transparent 30%),
-            linear-gradient(180deg, var(--bg0), var(--bg0));
+          background: radial-gradient(1200px 600px at 20% 0%, rgba(0,255,191,0.10), transparent 60%),
+                      radial-gradient(900px 600px at 80% 10%, rgba(140,25,255,0.10), transparent 60%),
+                      linear-gradient(180deg, rgba(255,255,255,0.02), transparent 40%),
+                      var(--bg0);
         }
-
         .topbar{
           display:flex;
           align-items:center;
-          gap:14px;
-          padding:14px 16px;
+          justify-content:space-between;
+          padding:16px;
         }
-
         .brand{
-          font-weight:800;
-          letter-spacing:-0.02em;
-          font-size:22px;
-          opacity:0.95;
-        }
-
-        .pill{
-          border: 1px solid var(--border);
-          background: rgba(255,255,255,0.04);
-          color: var(--text);
-          padding: 8px 10px;
-          border-radius: 12px;
           display:flex;
           align-items:center;
-          gap:8px;
-          backdrop-filter: blur(10px);
+          gap:12px;
+          font-weight:800;
+          letter-spacing:0.2px;
+          font-size:22px;
         }
-
         .btn{
-          border: 1px solid var(--border);
+          border:1px solid var(--border);
           background: rgba(255,255,255,0.06);
           color: var(--text);
           padding: 8px 12px;
           border-radius: 12px;
           cursor:pointer;
-          transition: transform 120ms ease, background 120ms ease;
-          user-select:none;
         }
-        .btn:hover{ background: rgba(255,255,255,0.09); transform: translateY(-1px); }
-        .btn:active{ transform: translateY(0px) scale(0.99); }
-
-        .statusRow{
-          margin-left:auto;
-          display:flex;
-          align-items:center;
-          gap:10px;
+        .btn:disabled{ opacity:0.45; cursor:not-allowed; }
+        .status{
+          padding: 8px 12px;
+          border:1px solid var(--border);
+          border-radius: 14px;
+          background: rgba(0,0,0,0.25);
           color: var(--textDim);
           font-size: 13px;
         }
 
-        .pathLine{
-          padding: 0 16px 10px 16px;
-          color: var(--textDim);
-          font-size: 12px;
-          white-space: nowrap;
-          overflow:hidden;
-          text-overflow: ellipsis;
-        }
-
-        .content{
-          flex:1;
-          display:grid;
-          grid-template-columns: 320px 1fr;
-          gap: 14px;
-          padding: 0 16px 110px 16px; /* reserve for bottom player */
-          min-height:0;
-        }
-
-        .panel{
-          border: 1px solid var(--border);
-          background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
-          border-radius: 18px;
-          backdrop-filter: blur(12px);
-          box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-          min-height:0;
-        }
-
-        .panelHeader{
-          padding: 14px 14px 10px 14px;
-          font-weight: 700;
-          color: var(--text);
+        .downloadBar{
           display:flex;
           align-items:center;
-          justify-content:space-between;
+          gap: 10px;
+          padding: 0 16px 12px 16px;
         }
-
-        .list{
-          padding: 8px;
-          height: calc(100% - 52px);
-          overflow:auto;
-        }
-
-        .plItem{
-          display:flex;
-          align-items:center;
-          gap:10px;
-          padding: 10px 10px;
-          border-radius: 12px;
-          cursor:pointer;
-          color: var(--text);
-          border: 1px solid transparent;
-        }
-        .plItem:hover{ background: rgba(255,255,255,0.06); }
-        .plItem.active{
-          background: rgba(0,255,191,0.08);
-          border-color: rgba(0,255,191,0.28);
-        }
-
-        .tracksTop{
-          display:flex;
-          align-items:center;
-          gap: 12px;
-          width:100%;
-        }
-
-        .search{
-          flex:1;
+        .downloadInput{
+          flex: 1;
           border: 1px solid var(--border);
           background: rgba(0,0,0,0.25);
           color: var(--text);
@@ -525,310 +391,283 @@ export default function App() {
           border-radius: 14px;
           outline:none;
         }
-        .search:focus{
+        .downloadInput:focus{
           border-color: rgba(0,255,191,0.45);
           box-shadow: 0 0 0 3px rgba(0,255,191,0.08);
         }
-
-        .count{
+        .downloadLogs{
+          margin: 0 16px 12px 16px;
+          border: 1px solid var(--border);
+          background: rgba(0,0,0,0.25);
+          border-radius: 14px;
+          max-height: 180px;
+          overflow:auto;
+        }
+        .downloadLogs pre{
+          margin: 0;
+          padding: 10px 12px;
+          font-size: 12px;
           color: var(--textDim);
-          font-size: 13px;
-          white-space: nowrap;
+          white-space: pre-wrap;
+          word-break: break-word;
         }
 
+        .pathLine{
+          padding: 0 16px 12px 16px;
+          color: var(--textDim);
+          font-size: 13px;
+        }
+        .content{
+          flex:1;
+          display:grid;
+          grid-template-columns: 320px 1fr;
+          gap:16px;
+          padding: 0 16px 16px 16px;
+          min-height: 0;
+        }
+        .panel{
+          border:1px solid var(--border);
+          background: rgba(0,0,0,0.22);
+          border-radius: 18px;
+          overflow:hidden;
+          min-height:0;
+        }
+        .panelHeader{
+          padding:12px 14px;
+          font-weight:700;
+          border-bottom:1px solid var(--border);
+          background: rgba(255,255,255,0.03);
+        }
+        .list{
+          padding:10px;
+          overflow:auto;
+          max-height:100%;
+        }
+        .pill{
+          padding:10px 12px;
+          border-radius: 14px;
+          cursor:pointer;
+          border:1px solid transparent;
+          color: var(--text);
+          margin-bottom: 8px;
+          background: rgba(255,255,255,0.03);
+        }
+        .pill.active{
+          border-color: rgba(0,255,191,0.35);
+          background: rgba(0,255,191,0.10);
+        }
+        .searchRow{
+          padding: 10px;
+          border-bottom:1px solid var(--border);
+          display:flex;
+          gap:10px;
+          align-items:center;
+          background: rgba(0,0,0,0.10);
+        }
+        .search{
+          flex:1;
+          border:1px solid var(--border);
+          background: rgba(0,0,0,0.18);
+          color: var(--text);
+          padding: 10px 12px;
+          border-radius: 14px;
+          outline:none;
+        }
         .trackRow{
+          padding:10px 12px;
+          border-radius: 14px;
+          cursor:pointer;
+          border:1px solid transparent;
+          background: rgba(255,255,255,0.02);
+          margin-bottom:8px;
+        }
+        .trackRow.active{
+          border-color: rgba(140,25,255,0.35);
+          background: rgba(140,25,255,0.10);
+        }
+
+        .player{
+          border-top:1px solid var(--border);
+          padding: 12px 16px;
+          background: rgba(0,0,0,0.25);
           display:flex;
           align-items:center;
           justify-content:space-between;
-          gap: 10px;
-          padding: 10px 10px;
-          border-radius: 12px;
-          cursor:pointer;
-          border: 1px solid transparent;
+          gap: 16px;
         }
-        .trackRow:hover{ background: rgba(255,255,255,0.05); }
-        .trackRow.active{
-          background: rgba(140,25,255,0.10);
-          border-color: rgba(140,25,255,0.28);
-        }
-
-        .tName{
-          color: var(--text);
-          font-size: 14px;
-          line-height: 1.25;
-          overflow:hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-        }
-        .tMeta{
-          color: var(--textDim);
-          font-size: 12px;
-          white-space: nowrap;
-          margin-left: 10px;
-          opacity:0.95;
-        }
-
-        /* Spotify-ish bottom bar */
-        .playerBar{
-          position: fixed;
-          left: 12px;
-          right: 12px;
-          bottom: 12px;
-          height: 86px;
-          border-radius: 18px;
-          border: 1px solid var(--border);
-          background:
-            linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
-          backdrop-filter: blur(14px);
-          box-shadow: 0 20px 60px rgba(0,0,0,0.50);
-          display:grid;
-          grid-template-columns: 1fr 360px 1fr;
-          align-items:center;
-          padding: 12px 14px;
-          gap: 14px;
-        }
-
         .nowPlaying{
-          min-width:0;
           display:flex;
           flex-direction:column;
-          gap: 4px;
+          gap: 2px;
+          min-width: 260px;
         }
-        .npTitle{
-          font-weight: 650;
-          color: var(--text);
-          font-size: 13px;
-          overflow:hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-        }
-        .npSub{
-          color: var(--textDim);
-          font-size: 12px;
-          overflow:hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-        }
-
+        .npTitle{ font-weight:800; }
+        .npSub{ color: var(--textDim); font-size: 12px; }
         .controls{
           display:flex;
-          flex-direction:column;
           align-items:center;
-          justify-content:center;
-          gap: 8px;
+          gap: 10px;
         }
-
-        .btnRow{
-          display:flex;
-          align-items:center;
-          justify-content:center;
-          gap: 12px;
-        }
-
-        .iconBtn{
-          width: 36px;
-          height: 36px;
-          border-radius: 999px;
-          border: 1px solid var(--border);
-          background: rgba(255,255,255,0.05);
-          color: var(--text);
-          display:flex;
-          align-items:center;
-          justify-content:center;
-          cursor:pointer;
-          transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
-          user-select:none;
-        }
-        .iconBtn:hover{ background: rgba(255,255,255,0.08); transform: translateY(-1px); }
-        .iconBtn:active{ transform: translateY(0px) scale(0.99); }
-
-        .playBtn{
+        .circle{
           width: 44px;
           height: 44px;
-          background: rgba(255,255,255,0.92);
-          color: #111;
-          border-color: rgba(255,255,255,0.45);
+          border-radius: 999px;
+          border:1px solid var(--border);
+          background: rgba(255,255,255,0.06);
+          color: var(--text);
+          display:grid;
+          place-items:center;
+          cursor:pointer;
         }
-
-        .shuffleOn{
-          border-color: rgba(0,255,191,0.55);
-          box-shadow: 0 0 0 3px rgba(0,255,191,0.10);
-        }
-
         .timeline{
+          flex:1;
           display:flex;
           align-items:center;
           gap: 10px;
-          width: 100%;
         }
-
-        .time{
-          width: 44px;
-          text-align:center;
-          font-size: 12px;
-          color: var(--textDim);
-          font-variant-numeric: tabular-nums;
-        }
-
-        .range{
-          flex:1;
-          appearance:none;
-          height: 4px;
-          border-radius: 999px;
-          background: rgba(255,255,255,0.12);
-          outline:none;
-        }
-        .range::-webkit-slider-thumb{
-          appearance:none;
-          width: 14px;
-          height: 14px;
-          border-radius: 999px;
-          background: linear-gradient(180deg, var(--accent), var(--accent2));
-          border: 2px solid rgba(0,0,0,0.35);
-          cursor:pointer;
-        }
-
+        .time{ color: var(--textDim); font-size: 12px; min-width: 44px; text-align:center; }
+        .range{ width: 100%; }
         .rightInfo{
           display:flex;
           align-items:center;
-          justify-content:flex-end;
+          gap: 10px;
           color: var(--textDim);
           font-size: 12px;
-          gap: 10px;
-          white-space: nowrap;
+          min-width: 140px;
+          justify-content:flex-end;
+        }
+        /* Scrollbars */
+        * {
+          scrollbar-width: thin;
+          scrollbar-color: rgba(255,255,255,0.18) rgba(0,0,0,0.25);
         }
 
-        @media (max-width: 980px){
-          .content{ grid-template-columns: 280px 1fr; }
-          .playerBar{ grid-template-columns: 1fr 300px 1fr; }
+        *::-webkit-scrollbar { width: 10px; height: 10px; }
+        *::-webkit-scrollbar-track {
+          background: rgba(0,0,0,0.25);
+          border-radius: 999px;
         }
-
-        @media (max-width: 820px){
-          .content{ grid-template-columns: 1fr; }
-          .playerBar{ grid-template-columns: 1fr; height: 120px; }
-          .rightInfo{ display:none; }
-          .controls{ align-items:stretch; }
+        *::-webkit-scrollbar-thumb {
+          background: rgba(255,255,255,0.16);
+          border-radius: 999px;
+          border: 2px solid rgba(0,0,0,0.25);
+        }
+        *::-webkit-scrollbar-thumb:hover {
+          background: rgba(255,255,255,0.24);
         }
       `}</style>
 
       <div className="topbar">
-        <div className="brand">music-hood</div>
-        <button className="btn" onClick={importFolder}>Import</button>
-
-        <div className="statusRow">
-          <div className="pill">Status: {status}</div>
+        <div className="brand">
+          <div>music-hood</div>
+          <button className="btn" onClick={importFolder}>Import</button>
         </div>
+        <div className="status">Status: {status}</div>
       </div>
 
       <div className="pathLine">
         {folder ? `Folder: ${folder}` : "Pick a folder to begin."}
       </div>
 
+      <div className="downloadBar">
+        <input
+          className="downloadInput"
+          placeholder="Paste a YouTube URL and hit Download…"
+          value={downloadUrl}
+          onChange={(e) => setDownloadUrl(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") startManualDownload();
+          }}
+        />
+        <button className="btn" onClick={startManualDownload} disabled={dlBusy || !downloadUrl.trim()}>
+          {dlBusy ? "Downloading…" : "Download"}
+        </button>
+        <button className="btn" onClick={() => setDlLogs("")} disabled={!dlLogs}>
+          Clear logs
+        </button>
+      </div>
+
+      {dlLogs ? (
+        <div className="downloadLogs">
+          <pre>{dlLogs}</pre>
+        </div>
+      ) : null}
+
       <div className="content">
         <div className="panel">
-          <div className="panelHeader">
-            <div>Playlists</div>
-          </div>
-
+          <div className="panelHeader">Playlists</div>
           <div className="list">
             {playlists.map((p) => (
               <div
                 key={p}
-                className={"plItem " + (p === playlist ? "active" : "")}
+                className={`pill ${p === playlist ? "active" : ""}`}
                 onClick={() => setPlaylist(p)}
-                title={p}
               >
-                <div style={{ fontWeight: 650, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {p}
-                </div>
+                {p}
               </div>
             ))}
           </div>
         </div>
 
         <div className="panel">
-          <div className="panelHeader">
-            <div className="tracksTop">
-              <div style={{ fontWeight: 750 }}>Tracks</div>
-              <input
-                className="search"
-                placeholder="Search…"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-              />
-              <div className="count">{shownCount} shown</div>
-            </div>
+          <div className="panelHeader">Tracks</div>
+          <div className="searchRow">
+            <input
+              className="search"
+              placeholder="Search…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+            <button className="btn" onClick={() => setShuffle((s) => !s)}>
+              {shuffle ? "Shuffle: on" : "Shuffle: off"}
+            </button>
           </div>
-
           <div className="list">
-            {filteredTracks.map((t) => {
-              const active = t.path === currentPath;
-              return (
-                <div
-                  key={t.path}
-                  className={"trackRow " + (active ? "active" : "")}
-                  onClick={() => loadAndPlay(t)}
-                  title={t.path}
-                >
-                  <div className="tName">{formatDisplayName(t.name)}</div>
-                  <div className="tMeta">{t.playlist}</div>
-                </div>
-              );
-            })}
+            {filteredTracks.map((t) => (
+              <div
+                key={t.path}
+                className={`trackRow ${t.path === currentPath ? "active" : ""}`}
+                onClick={() => loadAndPlay(t)}
+              >
+                {t.name}
+              </div>
+            ))}
           </div>
         </div>
       </div>
 
-      <div className="playerBar">
+      <div className="player">
         <div className="nowPlaying">
-          <div className="npTitle">{nowPlayingLabel}</div>
+          <div className="npTitle">{currentName || "Nothing playing"}</div>
           <div className="npSub">
-            {playlist === "(all)" ? "All playlists" : `Filtered: ${playlist}`} • {allTracks.length} tracks
+            {currentPlaylist ? `All playlists • ${allTracks.length} tracks` : `All playlists • ${allTracks.length} tracks`}
           </div>
         </div>
 
         <div className="controls">
-          <div className="btnRow">
-            <button className="iconBtn" onClick={prevTrack} title="Previous">
-              ⏮
-            </button>
+          <button className="circle" onClick={playPrev} title="Previous">⏮</button>
+          <button className="circle" onClick={togglePlay} title="Play/Pause">{isPlaying ? "⏸" : "▶"}</button>
+          <button className="circle" onClick={playNext} title="Next">⏭</button>
+        </div>
 
-            <button className="iconBtn playBtn" onClick={togglePlayPause} title="Play/Pause">
-              {isPlaying ? "⏸" : "▶"}
-            </button>
-
-            <button className="iconBtn" onClick={nextTrack} title="Next">
-              ⏭
-            </button>
-
-            <button
-              className={"iconBtn " + (shuffle ? "shuffleOn" : "")}
-              onClick={() => setShuffle((s) => !s)}
-              title="Shuffle"
-            >
-              🔀
-            </button>
-          </div>
-
-          <div className="timeline">
-            <div className="time">{formatTime(progress)}</div>
-            <input
-              className="range"
-              type="range"
-              min={0}
-              max={Math.max(0, duration || 0)}
-              value={clamp(progress, 0, duration || 0)}
-              step={0.25}
-              onChange={(e) => {
-                const audio = audioRef.current;
-                if (!audio) return;
-                const v = Number(e.target.value);
-                audio.currentTime = clamp(v, 0, audio.duration || 0);
-                setProgress(audio.currentTime);
-              }}
-            />
-            <div className="time">{formatTime(duration)}</div>
-          </div>
+        <div className="timeline">
+          <div className="time">{formatTime(progress)}</div>
+          <input
+            className="range"
+            type="range"
+            min={0}
+            max={duration || 0}
+            step={0.25}
+            value={clamp(progress, 0, duration || 0)}
+            onChange={(e) => {
+              const audio = audioRef.current;
+              if (!audio) return;
+              const v = Number(e.target.value);
+              audio.currentTime = clamp(v, 0, audio.duration || 0);
+              setProgress(audio.currentTime);
+            }}
+          />
+          <div className="time">{formatTime(duration)}</div>
         </div>
 
         <div className="rightInfo">
@@ -837,7 +676,6 @@ export default function App() {
           <div>{currentIndex >= 0 ? `${currentIndex + 1}/${shownCount}` : `0/${shownCount}`}</div>
         </div>
 
-        {/* Hidden audio element driven by Tauri asset URLs */}
         <audio ref={audioRef} preload="metadata" />
       </div>
     </div>
