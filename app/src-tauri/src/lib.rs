@@ -614,6 +614,26 @@ fn delete_track(args: DeleteArgs) -> Result<(), String> {
   Ok(())
 }
 
+/// Newest audio file in `dir` modified at/after `since` (with a little slack for clock granularity).
+fn newest_audio_since(dir: &Path, since: std::time::SystemTime) -> Option<PathBuf> {
+  let floor = since.checked_sub(std::time::Duration::from_secs(5)).unwrap_or(since);
+  let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+  for e in std::fs::read_dir(dir).ok()?.flatten() {
+    let p = e.path();
+    if !p.is_file() || !is_audio_file(&p) {
+      continue;
+    }
+    let Ok(m) = e.metadata().and_then(|m| m.modified()) else { continue };
+    if m < floor {
+      continue;
+    }
+    if best.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
+      best = Some((m, p));
+    }
+  }
+  best.map(|(_, p)| p)
+}
+
 fn find_bin_by_prefix(dir: &Path, prefix: &str) -> Option<PathBuf> {
   let entries = std::fs::read_dir(dir).ok()?;
   for e in entries.flatten() {
@@ -722,6 +742,7 @@ async fn ytdlp_download_audio(app: AppHandle, args: YtDlpArgs) -> Result<(), Str
     .args(argv)
     .current_dir(out_dir.clone());
 
+  let started = std::time::SystemTime::now();
   let (mut rx, _child) = cmd.spawn().map_err(|e| format!("Failed to spawn yt-dlp: {e}"))?;
 
   tauri::async_runtime::spawn(async move {
@@ -737,6 +758,13 @@ async fn ytdlp_download_audio(app: AppHandle, args: YtDlpArgs) -> Result<(), Str
         }
         CommandEvent::Terminated(payload) => {
           let code = payload.code.unwrap_or(1);
+          // Tell the UI which file this download produced: the newest audio file in the
+          // target folder written since we started (no log parsing).
+          if code == 0 {
+            if let Some(p) = newest_audio_since(&out_dir, started) {
+              let _ = app.emit("ytdlp:file", p.to_string_lossy().to_string());
+            }
+          }
           let _ = app.emit("ytdlp:done", code);
         }
         _ => {}

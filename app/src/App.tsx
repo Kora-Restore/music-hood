@@ -1,5 +1,6 @@
 import { Store } from "@tauri-apps/plugin-store";
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
@@ -47,6 +48,29 @@ const DEFAULT_DOWNLOAD_TARGET = "Downloads";
 const NEW_FOLDER_SENTINEL = "__new__";
 
 const KEY_VOLUME = "volume";
+const KEY_SORT = "sort";
+const KEY_DOWNLOAD_PLAYLISTS = "download_playlists";
+
+// Track-list sort orders. "natural" = playlist order inside a playlist, filename order elsewhere.
+const SORT_MODES = ["Natural order", "Title A→Z", "Title Z→A", "Artist A→Z", "Longest first", "Shortest first"] as const;
+type SortMode = (typeof SORT_MODES)[number];
+
+const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+
+function sortTracks(list: Track[], mode: SortMode): Track[] {
+  if (mode === "Natural order") return list;
+  const title = (t: Track) => t.title || displayName(t.name);
+  const artist = (t: Track) => t.artist || "￿"; // untagged last
+  const out = [...list];
+  switch (mode) {
+    case "Title A→Z": out.sort((a, b) => collator.compare(title(a), title(b))); break;
+    case "Title Z→A": out.sort((a, b) => collator.compare(title(b), title(a))); break;
+    case "Artist A→Z": out.sort((a, b) => collator.compare(artist(a), artist(b)) || collator.compare(title(a), title(b))); break;
+    case "Longest first": out.sort((a, b) => b.duration_secs - a.duration_secs); break;
+    case "Shortest first": out.sort((a, b) => a.duration_secs - b.duration_secs); break;
+  }
+  return out;
+}
 
 // Shuffle icon: two straight parallel arrows when off, crossing arrows when on.
 function ShuffleIcon({ on }: { on: boolean }) {
@@ -155,6 +179,70 @@ function Dropdown({ value, options, onSelect, placeholder, extra, up, className,
   );
 }
 
+// Multi-choice dropdown: stays open while ticking; the button shows a summary.
+type MultiDropdownProps = {
+  values: string[];
+  options: string[];
+  onChange: (next: string[]) => void;
+  placeholder: string;
+  title?: string;
+  className?: string;
+};
+
+function MultiDropdown({ values, options, onChange, placeholder, title, className }: MultiDropdownProps) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  function toggle(o: string) {
+    onChange(values.includes(o) ? values.filter((v) => v !== o) : [...values, o]);
+  }
+
+  const label =
+    values.length === 0 ? placeholder : values.length === 1 ? values[0] : `${values.length} playlists`;
+
+  return (
+    <div className={`dd ${className ?? ""}`} ref={ref}>
+      <button type="button" className={`ddBtn ${open ? "open" : ""} ${values.length ? "hasValues" : ""}`} title={title} onClick={() => setOpen((o) => !o)}>
+        <span className="ddLabel">{label}</span>
+        <span className="ddChevron">▾</span>
+      </button>
+      {open ? (
+        <div className="ddMenu">
+          {options.length === 0 ? <div className="ddItem dimText">No playlists yet</div> : null}
+          {options.map((o) => {
+            const on = values.includes(o);
+            return (
+              <div key={o} className={`ddItem ddCheck ${on ? "active" : ""}`} onClick={() => toggle(o)}>
+                <span className="ddBox">{on ? "✓" : ""}</span>
+                {o}
+              </div>
+            );
+          })}
+          {values.length ? (
+            <div className="ddItem ddExtra" onClick={() => onChange([])}>Clear</div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 const COLORS = {
   bg0: "#0f0f0f",
   bg1: "#212121",
@@ -198,12 +286,15 @@ export default function App() {
   const [artistQuery, setArtistQuery] = useState<string>("");
   const [playlistQuery, setPlaylistQuery] = useState<string>("");
   const [query, setQuery] = useState<string>("");
+  const [sortMode, setSortMode] = useState<SortMode>("Natural order");
 
   const [currentPath, setCurrentPath] = useState<string>("");
   // Single click selects (highlight only); double click plays. Selection is what "Move selected" acts on.
-  const [selectedPath, setSelectedPath] = useState<string>("");
+  // Multi-select: a set of paths. Click = single, Ctrl+click = toggle, Shift+click = range, Ctrl+A = all listed.
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(() => new Set());
+  const anchorRef = useRef<string>("");
   // Track awaiting delete confirmation (the in-app "are you sure" box).
-  const [confirmDelete, setConfirmDelete] = useState<Track | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<Track[] | null>(null);
   // Tag editor (single track) and the batch "tags from filenames" confirmation.
   const [editTags, setEditTags] = useState<{ track: Track; title: string; artist: string } | null>(null);
   const [confirmFix, setConfirmFix] = useState<boolean>(false);
@@ -246,6 +337,24 @@ export default function App() {
   const [dlTarget, setDlTarget] = useState<string>(DEFAULT_DOWNLOAD_TARGET);
   const [newFolderName, setNewFolderName] = useState<string>("");
   const [newFolderMode, setNewFolderMode] = useState<boolean>(false);
+  // Playlists a finished download is added to (remembered between downloads).
+  const [dlPlaylists, setDlPlaylists] = useState<string[]>([]);
+  const dlPlaylistsRef = useRef<string[]>([]);
+  useEffect(() => {
+    dlPlaylistsRef.current = dlPlaylists;
+  }, [dlPlaylists]);
+  const lastDownloadRef = useRef<string>("");
+
+  async function chooseDlPlaylists(next: string[]) {
+    setDlPlaylists(next);
+    try {
+      const store = await storePromise;
+      await store.set(KEY_DOWNLOAD_PLAYLISTS, next);
+      await store.save();
+    } catch {
+      /* non-fatal */
+    }
+  }
 
   // IMPORTANT: avoid duplicate ytdlp listeners in dev/hmr by using a ref for latest folder
   const folderRef = useRef<string>("");
@@ -343,9 +452,9 @@ export default function App() {
         const t = tracksByKey.get(e.toLowerCase());
         if (t && matches(t)) out.push(t);
       }
-      return out;
+      return sortTracks(out, sortMode);
     }
-    return allTracks.filter((t) => {
+    const out = allTracks.filter((t) => {
       if (artistView) {
         // virtual playlist: every track by this artist, whatever folder it lives in
         if (!splitArtists(t.artist).includes(artistView)) return false;
@@ -354,7 +463,19 @@ export default function App() {
       }
       return matches(t);
     });
-  }, [allTracks, playlist, artistView, plView, currentPlaylistFile, tracksByKey, query]);
+    return sortTracks(out, sortMode);
+  }, [allTracks, playlist, artistView, plView, currentPlaylistFile, tracksByKey, query, sortMode]);
+
+  async function chooseSort(mode: SortMode) {
+    setSortMode(mode);
+    try {
+      const store = await storePromise;
+      await store.set(KEY_SORT, mode);
+      await store.save();
+    } catch {
+      /* non-fatal */
+    }
+  }
 
   // Is the selected track already in a given playlist file?
   function inPlaylist(pl: PlaylistFile, t: Track) {
@@ -462,10 +583,55 @@ export default function App() {
     [allTracks, currentPath]
   );
 
-  const selectedTrack = useMemo(
-    () => (selectedPath ? allTracks.find((t) => t.path === selectedPath) ?? null : null),
-    [allTracks, selectedPath]
+  // Selected tracks in list order (only those currently listed count).
+  const selectedTracks = useMemo(
+    () => (selectedPaths.size ? filteredTracks.filter((t) => selectedPaths.has(t.path)) : []),
+    [filteredTracks, selectedPaths]
   );
+  const selectedTrack = selectedTracks.length === 1 ? selectedTracks[0] : null;
+
+  function onRowClick(e: ReactMouseEvent, t: Track) {
+    const paths = filteredTracks.map((x) => x.path);
+    setSelectedPaths((prev) => {
+      const next = new Set(prev);
+      if (e.shiftKey && anchorRef.current) {
+        const a = paths.indexOf(anchorRef.current);
+        const b = paths.indexOf(t.path);
+        if (a >= 0 && b >= 0) {
+          if (!e.ctrlKey && !e.metaKey) next.clear();
+          for (let i = Math.min(a, b); i <= Math.max(a, b); i++) next.add(paths[i]);
+          return next;
+        }
+      }
+      if (e.ctrlKey || e.metaKey) {
+        if (next.has(t.path)) next.delete(t.path);
+        else next.add(t.path);
+      } else if (next.size === 1 && next.has(t.path)) {
+        next.clear();
+      } else {
+        next.clear();
+        next.add(t.path);
+      }
+      anchorRef.current = t.path;
+      return next;
+    });
+  }
+
+  // Ctrl+A selects everything listed (unless typing in a field); Escape clears the selection.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        setSelectedPaths(new Set(filteredTracks.map((t) => t.path)));
+      } else if (e.key === "Escape") {
+        setSelectedPaths(new Set());
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [filteredTracks]);
 
   const currentIndex = useMemo(() => {
     if (!currentPath) return -1;
@@ -579,7 +745,13 @@ export default function App() {
       setAllTracks((prev) =>
         prev.map((t) => (t.path === fromPath ? { ...moved, artist: moved.artist || t.artist } : t))
       );
-      if (selectedPath === fromPath) setSelectedPath(moved.path);
+      setSelectedPaths((prev) => {
+        if (!prev.has(fromPath)) return prev;
+        const next = new Set(prev);
+        next.delete(fromPath);
+        next.add(moved.path);
+        return next;
+      });
       setStatus(`Moved "${displayName(moved.name)}" to ${moved.playlist}`);
       await loadPlaylists(lib); // playlist files were updated on the Rust side
 
@@ -608,33 +780,49 @@ export default function App() {
   }
 
   // Send a track to the Recycle Bin (after the confirmation box). Stops it if it was playing.
-  async function deleteTrack(t: Track) {
+  async function deleteTracks(tracks: Track[]) {
     const lib = folderRef.current;
-    if (!lib) return;
-    try {
-      await invoke("delete_track", { args: { path: t.path, libraryDir: lib } });
-      if (t.path === currentPath) {
-        const audio = audioRef.current;
-        if (audio) {
-          audio.pause();
-          audio.removeAttribute("src");
-          audio.load();
-        }
-        setIsPlaying(false);
-        setCurrentPath("");
-        setCurrentName("");
-        setCurrentPlaylist("");
-        setProgress(0);
-        setDuration(0);
+    if (!lib || tracks.length === 0) return;
+    const done: string[] = [];
+    const failed: string[] = [];
+    for (const t of tracks) {
+      try {
+        await invoke("delete_track", { args: { path: t.path, libraryDir: lib } });
+        done.push(t.path);
+      } catch (err) {
+        failed.push(`${displayName(t.name)}: ${String(err)}`);
       }
-      if (t.path === selectedPath) setSelectedPath("");
-      setAllTracks((prev) => prev.filter((x) => x.path !== t.path));
-      setStatus(`Moved "${displayName(t.name)}" to the Recycle Bin`);
-      await loadPlaylists(lib);
-    } catch (err) {
-      setStatus(`Delete failed: ${String(err)}`);
-    } finally {
-      setConfirmDelete(null);
+    }
+    if (done.includes(currentPath)) {
+      const audio = audioRef.current;
+      if (audio) {
+        audio.pause();
+        audio.removeAttribute("src");
+        audio.load();
+      }
+      setIsPlaying(false);
+      setCurrentPath("");
+      setCurrentName("");
+      setCurrentPlaylist("");
+      setProgress(0);
+      setDuration(0);
+    }
+    const gone = new Set(done);
+    setSelectedPaths((prev) => new Set([...prev].filter((p) => !gone.has(p))));
+    setAllTracks((prev) => prev.filter((x) => !gone.has(x.path)));
+    setStatus(
+      done.length === 1 && failed.length === 0
+        ? `Moved "${displayName(tracks[0].name)}" to the Recycle Bin`
+        : `Recycle Bin: ${done.length} moved${failed.length ? `, ${failed.length} failed — ${failed[0]}` : ""}`
+    );
+    await loadPlaylists(lib);
+    setConfirmDelete(null);
+  }
+
+  // Move several files (Folders view). Each move keeps playlists consistent on the Rust side.
+  async function moveTracksTo(tracks: Track[], target: string) {
+    for (const t of tracks) {
+      if ((t.playlist || "(root)") !== target) await moveTrackTo(t.path, target);
     }
   }
 
@@ -735,6 +923,12 @@ export default function App() {
         const savedTarget = await store.get<string>(KEY_DOWNLOAD_TARGET);
         if (savedTarget && typeof savedTarget === "string") setDlTarget(savedTarget);
 
+        const savedDlPl = await store.get<string[]>(KEY_DOWNLOAD_PLAYLISTS);
+        if (Array.isArray(savedDlPl)) setDlPlaylists(savedDlPl.filter((x) => typeof x === "string"));
+
+        const savedSort = await store.get<string>(KEY_SORT);
+        if (savedSort && (SORT_MODES as readonly string[]).includes(savedSort)) setSortMode(savedSort as SortMode);
+
         const savedVolume = await store.get<number>(KEY_VOLUME);
         if (typeof savedVolume === "number" && savedVolume >= 0 && savedVolume <= 1) setVolume(savedVolume);
         settingsLoadedRef.current = true;
@@ -786,6 +980,7 @@ export default function App() {
     let unlistenOut: (() => void) | undefined;
     let unlistenErr: (() => void) | undefined;
     let unlistenDone: (() => void) | undefined;
+    let unlistenFile: (() => void) | undefined;
 
     const setup = async () => {
       const uOut = await listen<string>("ytdlp:stdout", (e) => {
@@ -799,11 +994,15 @@ export default function App() {
         setDlLogs((prev) => prev + chunk);
       });
 
+      const uFile = await listen<string>("ytdlp:file", (e) => {
+        lastDownloadRef.current = e.payload;
+      });
+
       const uDone = await listen<number>("ytdlp:done", async (e) => {
         setDlBusy(false);
         setDlLogs((prev) => prev + `\n[done] exit code: ${e.payload}\n`);
 
-        // Refresh library so the new file appears
+        // Refresh library so the new file appears, then file it into the chosen playlists
         const lib = folderRef.current;
         if (lib) {
           try {
@@ -812,6 +1011,21 @@ export default function App() {
             setAllTracks(found);
             setStatus(`Found ${found.length} tracks`);
             await loadPlaylists(lib);
+
+            const filePath = lastDownloadRef.current;
+            lastDownloadRef.current = "";
+            const targets = dlPlaylistsRef.current;
+            if (e.payload === 0 && filePath && targets.length) {
+              const t = found.find((x) => x.path === filePath);
+              if (t) {
+                for (const name of targets) {
+                  await invoke<PlaylistFile>("playlist_add", { args: { libraryDir: lib, name, paths: [t.path] } });
+                }
+                await loadPlaylists(lib);
+                setDlLogs((prev) => prev + `[music-hood] added to: ${targets.join(", ")}\n`);
+                setStatus(`Downloaded and added to ${targets.length} playlist${targets.length === 1 ? "" : "s"}`);
+              }
+            }
           } catch (err) {
             setStatus(`Refresh error: ${String(err)}`);
           }
@@ -822,12 +1036,14 @@ export default function App() {
       if (!active) {
         uOut();
         uErr();
+        uFile();
         uDone();
         return;
       }
 
       unlistenOut = uOut;
       unlistenErr = uErr;
+      unlistenFile = uFile;
       unlistenDone = uDone;
     };
 
@@ -837,6 +1053,7 @@ export default function App() {
       active = false;
       unlistenOut?.();
       unlistenErr?.();
+      unlistenFile?.();
       unlistenDone?.();
     };
   }, []);
@@ -997,6 +1214,18 @@ export default function App() {
         .iconBtn:hover{ color: var(--text); background: rgba(255,255,255,0.08); }
         .iconBtn.danger:hover{ color: #ff5c7a; border-color: rgba(255,92,122,0.45); background: rgba(255,92,122,0.10); }
         .iconBtn.small{ width: 30px; height: 30px; border-radius: 9px; }
+        .sortDd .ddBtn{ color: var(--textDim); font-size: 13px; }
+        .ddBtn.hasValues{ color: var(--accent); border-color: rgba(0,255,191,0.35); }
+        .ddCheck{ display:flex; align-items:center; gap: 8px; }
+        .ddBox{
+          width: 16px; height: 16px; flex:none;
+          border: 1px solid var(--border); border-radius: 5px;
+          display:grid; place-items:center; font-size: 11px; color: var(--accent);
+        }
+        .ddCheck.active .ddBox{ border-color: rgba(0,255,191,0.6); background: rgba(0,255,191,0.12); }
+        .selCount{ color: var(--accent); font-size: 13px; white-space: nowrap; display:flex; align-items:center; gap: 6px; }
+        .linkBtn{ background: none; border: none; color: var(--textDim); font: inherit; font-size: 12px; cursor: pointer; text-decoration: underline; padding: 0; }
+        .linkBtn:hover{ color: var(--text); }
         .headerRow{ display:flex; align-items:center; justify-content:space-between; gap: 10px; }
         .migrateBox{
           margin: 4px 4px 12px;
@@ -1298,6 +1527,14 @@ export default function App() {
             }}
           />
         )}
+        <span className="targetLabel">+ playlists</span>
+        <MultiDropdown
+          values={dlPlaylists}
+          options={playlistFiles.map((p) => p.name)}
+          onChange={chooseDlPlaylists}
+          placeholder="none"
+          title="Playlists the downloaded track is added to (remembered)"
+        />
         <button className="btn" onClick={startManualDownload} disabled={dlBusy || !downloadUrl.trim()}>
           {dlBusy ? "Downloading…" : "Download"}
         </button>
@@ -1477,37 +1714,52 @@ export default function App() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
-            {selectedTrack ? (
+            <Dropdown
+              className="sortDd"
+              value={sortMode}
+              options={[...SORT_MODES]}
+              title="Sort the track list"
+              onSelect={(v) => chooseSort(v as SortMode)}
+            />
+            {selectedTracks.length > 1 ? (
+              <span className="selCount" title="Esc clears the selection">
+                {selectedTracks.length} selected
+                <button className="linkBtn" onClick={() => setSelectedPaths(new Set())}>clear</button>
+              </span>
+            ) : null}
+            {selectedTracks.length > 0 ? (
               <Dropdown
                 value=""
-                placeholder="Add to playlist…"
-                title={`Add "${displayName(selectedTrack.name)}" to a playlist`}
-                options={playlistFiles.filter((p) => !inPlaylist(p, selectedTrack)).map((p) => p.name)}
+                placeholder={selectedTracks.length > 1 ? `Add ${selectedTracks.length} to playlist…` : "Add to playlist…"}
+                title="Add the selected track(s) to a playlist"
+                options={playlistFiles
+                  .filter((p) => !selectedTracks.every((t) => inPlaylist(p, t)))
+                  .map((p) => p.name)}
                 extra={{ label: "+ New playlist…", value: NEW_PLAYLIST_SENTINEL }}
                 onSelect={(v) => {
                   if (v === NEW_PLAYLIST_SENTINEL) {
                     setSideTab("playlists");
                     setNewPlaylistMode(true);
-                  } else addToPlaylist(v, [selectedTrack]);
+                  } else addToPlaylist(v, selectedTracks);
                 }}
               />
             ) : null}
-            {selectedTrack && plView && currentPlaylistFile && inPlaylist(currentPlaylistFile, selectedTrack) ? (
+            {selectedTracks.length > 0 && plView && currentPlaylistFile && selectedTracks.some((t) => inPlaylist(currentPlaylistFile, t)) ? (
               <button
                 className="btn"
-                title={`Remove "${displayName(selectedTrack.name)}" from ${plView} (the file stays)`}
-                onClick={() => removeFromPlaylist(plView, [selectedTrack])}
+                title={`Remove the selected track(s) from ${plView} (the files stay)`}
+                onClick={() => removeFromPlaylist(plView, selectedTracks)}
               >
-                Remove from playlist
+                Remove{selectedTracks.length > 1 ? ` ${selectedTracks.length}` : ""} from playlist
               </button>
             ) : null}
-            {selectedTrack && sideTab === "folders" ? (
+            {selectedTracks.length > 0 && sideTab === "folders" ? (
               <Dropdown
                 value=""
-                placeholder="Move file to…"
-                title={`Move the file "${displayName(selectedTrack.name)}" to another folder (playlists follow)`}
-                options={targetOptions.filter((name) => name !== (selectedTrack.playlist || "(root)"))}
-                onSelect={(target) => moveTrackTo(selectedTrack.path, target)}
+                placeholder={selectedTracks.length > 1 ? `Move ${selectedTracks.length} files to…` : "Move file to…"}
+                title="Move the selected file(s) to another folder (playlists follow)"
+                options={targetOptions.filter((name) => !selectedTracks.every((t) => (t.playlist || "(root)") === name))}
+                onSelect={(target) => moveTracksTo(selectedTracks, target)}
               />
             ) : null}
             {selectedTrack ? (
@@ -1519,11 +1771,11 @@ export default function App() {
                 <PencilIcon />
               </button>
             ) : null}
-            {selectedTrack ? (
+            {selectedTracks.length > 0 ? (
               <button
                 className="iconBtn danger"
-                title={`Delete "${displayName(selectedTrack.name)}" (to the Recycle Bin)`}
-                onClick={() => setConfirmDelete(selectedTrack)}
+                title={selectedTracks.length > 1 ? `Delete ${selectedTracks.length} tracks (to the Recycle Bin)` : `Delete "${displayName(selectedTracks[0].name)}" (to the Recycle Bin)`}
+                onClick={() => setConfirmDelete(selectedTracks)}
               >
                 <TrashIcon />
               </button>
@@ -1549,10 +1801,10 @@ export default function App() {
             {filteredTracks.map((t) => (
               <div
                 key={t.path}
-                className={`trackRow ${t.path === currentPath ? "active" : ""} ${t.path === selectedPath ? "selected" : ""}`}
-                onClick={() => setSelectedPath((p) => (p === t.path ? "" : t.path))}
+                className={`trackRow ${t.path === currentPath ? "active" : ""} ${selectedPaths.has(t.path) ? "selected" : ""}`}
+                onClick={(e) => onRowClick(e, t)}
                 onDoubleClick={() => loadAndPlay(t)}
-                title="Click to select · double-click to play"
+                title="Click to select · Ctrl+click adds · Shift+click ranges · double-click plays"
               >
                 {displayName(t.name)}
               </div>
@@ -1732,16 +1984,23 @@ export default function App() {
       {confirmDelete ? (
         <div className="modalBackdrop" onMouseDown={() => setConfirmDelete(null)}>
           <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
-            <div className="modalTitle">Delete this track?</div>
+            <div className="modalTitle">{confirmDelete.length > 1 ? `Delete ${confirmDelete.length} tracks?` : "Delete this track?"}</div>
             <div className="modalBody">
-              <div className="modalTrack">{displayName(confirmDelete.name)}</div>
+              <div className="modalTrack" style={{ maxHeight: 160, overflow: "auto" }}>
+                {confirmDelete.slice(0, 12).map((t) => (
+                  <div key={t.path}>{displayName(t.name)}</div>
+                ))}
+                {confirmDelete.length > 12 ? <div className="dimText">…and {confirmDelete.length - 12} more</div> : null}
+              </div>
               <div className="modalHint">
-                {confirmDelete.playlist} · the file goes to the Windows Recycle Bin, so this can be undone from there.
+                The files go to the Windows Recycle Bin, so this can be undone from there. Playlists are updated.
               </div>
             </div>
             <div className="modalActions">
               <button className="btn" onClick={() => setConfirmDelete(null)} autoFocus>Cancel</button>
-              <button className="btn dangerBtn" onClick={() => deleteTrack(confirmDelete)}>Delete</button>
+              <button className="btn dangerBtn" onClick={() => deleteTracks(confirmDelete)}>
+                {confirmDelete.length > 1 ? `Delete ${confirmDelete.length}` : "Delete"}
+              </button>
             </div>
           </div>
         </div>
