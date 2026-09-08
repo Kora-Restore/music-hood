@@ -15,6 +15,17 @@ type Track = {
 };
 
 const UNTAGGED = "(untagged)";
+const NEW_PLAYLIST_SENTINEL = "__newpl__";
+
+type PlaylistFile = { name: string; entries: string[] };
+
+// Absolute path → the key used inside playlist files: relative to the Music root, forward slashes.
+function relKey(root: string, abs: string): string {
+  const r = root.replace(/[\\/]+$/, "");
+  let rel = abs.startsWith(r) ? abs.slice(r.length) : abs;
+  rel = rel.replace(/^[\\/]+/, "");
+  return rel.replace(/\\/g, "/");
+}
 
 // "Schrotthagen, Giovanni Berg" / "A feat. B" → the individual names. Mirrors the Rust side:
 // no splitting on "&" or "x", so "Earth, Wind & Fire" survives as "Earth" + "Wind & Fire" at worst.
@@ -53,6 +64,15 @@ function ShuffleIcon({ on }: { on: boolean }) {
       <path d="M3 16h18" />
       <path d="M18.5 5.5L21 8l-2.5 2.5" />
       <path d="M18.5 13.5L21 16l-2.5 2.5" />
+    </svg>
+  );
+}
+
+function PencilIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 20h4l10.5-10.5a2.1 2.1 0 0 0-3-3L5 17v3z" />
+      <path d="M13.5 6.5l3 3" />
     </svg>
   );
 }
@@ -165,9 +185,16 @@ export default function App() {
   const [allTracks, setAllTracks] = useState<Track[]>([]);
 
   const [playlist, setPlaylist] = useState<string>("(all)");
-  // Left panel: folder playlists (the truth) or the virtual per-artist view (from tags).
-  const [sideTab, setSideTab] = useState<"playlists" | "artists">("playlists");
+  // Left panel: playlist FILES (membership, many-to-many) · Artists (from tags) · Folders (storage).
+  const [sideTab, setSideTab] = useState<"playlists" | "artists" | "folders">("playlists");
   const [artistView, setArtistView] = useState<string>("");
+  // The playlist file being viewed ("" = none). Exactly one of artistView / plView / folder is active.
+  const [plView, setPlView] = useState<string>("");
+  const [playlistFiles, setPlaylistFiles] = useState<PlaylistFile[]>([]);
+  const [plQuery, setPlQuery] = useState<string>("");
+  const [newPlaylistMode, setNewPlaylistMode] = useState<boolean>(false);
+  const [newPlaylistName, setNewPlaylistName] = useState<string>("");
+  const [confirmDeletePlaylist, setConfirmDeletePlaylist] = useState<string>("");
   const [artistQuery, setArtistQuery] = useState<string>("");
   const [playlistQuery, setPlaylistQuery] = useState<string>("");
   const [query, setQuery] = useState<string>("");
@@ -177,6 +204,11 @@ export default function App() {
   const [selectedPath, setSelectedPath] = useState<string>("");
   // Track awaiting delete confirmation (the in-app "are you sure" box).
   const [confirmDelete, setConfirmDelete] = useState<Track | null>(null);
+  // Tag editor (single track) and the batch "tags from filenames" confirmation.
+  const [editTags, setEditTags] = useState<{ track: Track; title: string; artist: string } | null>(null);
+  const [confirmFix, setConfirmFix] = useState<boolean>(false);
+  const [fixBusy, setFixBusy] = useState<boolean>(false);
+  const [fixReport, setFixReport] = useState<{ updated: number; skipped: number; failed: string[] } | null>(null);
   const [currentName, setCurrentName] = useState<string>("");
   const [currentPlaylist, setCurrentPlaylist] = useState<string>("");
 
@@ -279,8 +311,40 @@ export default function App() {
     return q ? artists.filter((a) => a.name.toLowerCase().includes(q)) : artists;
   }, [artists, artistQuery]);
 
+  // Tracks by their playlist-file key, for resolving m3u8 entries.
+  const tracksByKey = useMemo(() => {
+    const m = new Map<string, Track>();
+    const root = folder;
+    if (!root) return m;
+    for (const t of allTracks) m.set(relKey(root, t.path).toLowerCase(), t);
+    return m;
+  }, [allTracks, folder]);
+
+  const currentPlaylistFile = useMemo(
+    () => (plView ? playlistFiles.find((p) => p.name === plView) ?? null : null),
+    [playlistFiles, plView]
+  );
+
+  const shownPlaylistFiles = useMemo(() => {
+    const q = plQuery.trim().toLowerCase();
+    return q ? playlistFiles.filter((p) => p.name.toLowerCase().includes(q)) : playlistFiles;
+  }, [playlistFiles, plQuery]);
+
   const filteredTracks = useMemo(() => {
     const q = query.trim().toLowerCase();
+    const matches = (t: Track) => !q || t.name.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q);
+
+    if (plView) {
+      // playlist FILE: entries in their own order; entries whose file is gone are skipped
+      const pl = currentPlaylistFile;
+      if (!pl) return [];
+      const out: Track[] = [];
+      for (const e of pl.entries) {
+        const t = tracksByKey.get(e.toLowerCase());
+        if (t && matches(t)) out.push(t);
+      }
+      return out;
+    }
     return allTracks.filter((t) => {
       if (artistView) {
         // virtual playlist: every track by this artist, whatever folder it lives in
@@ -288,10 +352,108 @@ export default function App() {
       } else if (playlist !== "(all)" && (t.playlist || "(root)") !== playlist) {
         return false;
       }
-      if (!q) return true;
-      return t.name.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q);
+      return matches(t);
     });
-  }, [allTracks, playlist, artistView, query]);
+  }, [allTracks, playlist, artistView, plView, currentPlaylistFile, tracksByKey, query]);
+
+  // Is the selected track already in a given playlist file?
+  function inPlaylist(pl: PlaylistFile, t: Track) {
+    const k = relKey(folder, t.path).toLowerCase();
+    return pl.entries.some((e) => e.toLowerCase() === k);
+  }
+
+  async function loadPlaylists(lib: string) {
+    try {
+      const pls = await invoke<PlaylistFile[]>("list_playlists", { libraryDir: lib });
+      setPlaylistFiles(pls);
+    } catch (err) {
+      setStatus(`Playlists: ${String(err)}`);
+    }
+  }
+
+  async function createPlaylistsFromFolders() {
+    const lib = folderRef.current;
+    if (!lib) return;
+    try {
+      const pls = await invoke<PlaylistFile[]>("playlists_from_folders", { libraryDir: lib });
+      setPlaylistFiles(pls);
+      setStatus(`Created ${pls.length} playlist files in _Playlists`);
+    } catch (err) {
+      setStatus(`Playlists: ${String(err)}`);
+    }
+  }
+
+  async function addToPlaylist(name: string, tracks: Track[]) {
+    const lib = folderRef.current;
+    if (!lib || !name || tracks.length === 0) return;
+    try {
+      const pl = await invoke<PlaylistFile>("playlist_add", {
+        args: { libraryDir: lib, name, paths: tracks.map((t) => t.path) },
+      });
+      setPlaylistFiles((prev) => {
+        const i = prev.findIndex((p) => p.name === pl.name);
+        const next = i >= 0 ? prev.map((p) => (p.name === pl.name ? pl : p)) : [...prev, pl];
+        return next.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+      });
+      setStatus(`Added to ${pl.name}`);
+    } catch (err) {
+      setStatus(`Add failed: ${String(err)}`);
+    }
+  }
+
+  async function removeFromPlaylist(name: string, tracks: Track[]) {
+    const lib = folderRef.current;
+    if (!lib || !name || tracks.length === 0) return;
+    try {
+      const pl = await invoke<PlaylistFile>("playlist_remove", {
+        args: { libraryDir: lib, name, paths: tracks.map((t) => t.path) },
+      });
+      setPlaylistFiles((prev) => prev.map((p) => (p.name === pl.name ? pl : p)));
+      setStatus(`Removed from ${pl.name}`);
+    } catch (err) {
+      setStatus(`Remove failed: ${String(err)}`);
+    }
+  }
+
+  async function createPlaylist(name: string) {
+    const lib = folderRef.current;
+    const clean = name.trim();
+    if (!lib || !clean) return;
+    try {
+      const pl = await invoke<PlaylistFile>("playlist_create", { args: { libraryDir: lib, name: clean } });
+      setPlaylistFiles((prev) =>
+        prev.some((p) => p.name === pl.name)
+          ? prev
+          : [...prev, pl].sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()))
+      );
+      setNewPlaylistMode(false);
+      setNewPlaylistName("");
+      openPlaylistView(pl.name);
+    } catch (err) {
+      setStatus(`Create failed: ${String(err)}`);
+    }
+  }
+
+  async function deletePlaylist(name: string) {
+    const lib = folderRef.current;
+    if (!lib || !name) return;
+    try {
+      await invoke("playlist_delete", { args: { libraryDir: lib, name } });
+      setPlaylistFiles((prev) => prev.filter((p) => p.name !== name));
+      if (plView === name) setPlView("");
+      setStatus(`Playlist "${name}" moved to the Recycle Bin (tracks untouched)`);
+    } catch (err) {
+      setStatus(`Delete failed: ${String(err)}`);
+    } finally {
+      setConfirmDeletePlaylist("");
+    }
+  }
+
+  function openPlaylistView(name: string) {
+    setArtistView("");
+    setPlaylist("(all)");
+    setPlView(name);
+  }
 
   const shownCount = filteredTracks.length;
 
@@ -327,6 +489,7 @@ export default function App() {
       const found = await invoke<Track[]>("scan_music_folder", { dir: lib });
       setAllTracks(found);
       setStatus(`Found ${found.length} tracks`);
+      await loadPlaylists(lib);
     } catch (err) {
       setStatus(`Scan error: ${String(err)}`);
     }
@@ -349,8 +512,11 @@ export default function App() {
 
       setAllTracks(found);
       setPlaylist("(all)");
+      setPlView("");
+      setArtistView("");
       setQuery("");
       setStatus(`Found ${found.length} tracks`);
+      await loadPlaylists(picked);
     } catch (err) {
       setStatus(`Scan error: ${String(err)}`);
     }
@@ -415,6 +581,7 @@ export default function App() {
       );
       if (selectedPath === fromPath) setSelectedPath(moved.path);
       setStatus(`Moved "${displayName(moved.name)}" to ${moved.playlist}`);
+      await loadPlaylists(lib); // playlist files were updated on the Rust side
 
       if (fromPath !== currentPath) return;
 
@@ -463,6 +630,7 @@ export default function App() {
       if (t.path === selectedPath) setSelectedPath("");
       setAllTracks((prev) => prev.filter((x) => x.path !== t.path));
       setStatus(`Moved "${displayName(t.name)}" to the Recycle Bin`);
+      await loadPlaylists(lib);
     } catch (err) {
       setStatus(`Delete failed: ${String(err)}`);
     } finally {
@@ -470,15 +638,71 @@ export default function App() {
     }
   }
 
-  // Escape closes the confirmation box.
+  // Escape closes whichever box is open.
   useEffect(() => {
-    if (!confirmDelete) return;
+    if (!confirmDelete && !editTags && !confirmFix && !confirmDeletePlaylist) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setConfirmDelete(null);
+      if (e.key === "Escape") {
+        setConfirmDelete(null);
+        setEditTags(null);
+        setConfirmFix(false);
+        setConfirmDeletePlaylist("");
+      }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [confirmDelete]);
+  }, [confirmDelete, editTags, confirmFix, confirmDeletePlaylist]);
+
+  // "Song - Artist" from a filename — the library convention.
+  function titleArtistFromName(name: string): { title: string; artist: string } {
+    const stem = displayName(name);
+    const i = stem.lastIndexOf(" - ");
+    if (i > 0 && i < stem.length - 3) {
+      return { title: stem.slice(0, i).trim(), artist: stem.slice(i + 3).trim() };
+    }
+    return { title: stem.trim(), artist: "" };
+  }
+
+  function openTagEditor(t: Track) {
+    setEditTags({ track: t, title: t.title, artist: t.artist });
+  }
+
+  async function saveTags() {
+    const lib = folderRef.current;
+    if (!editTags || !lib) return;
+    try {
+      const updated = await invoke<Track>("write_tags", {
+        args: { path: editTags.track.path, libraryDir: lib, title: editTags.title, artist: editTags.artist },
+      });
+      setAllTracks((prev) => prev.map((t) => (t.path === updated.path ? updated : t)));
+      setStatus(`Tags saved: ${displayName(updated.name)}`);
+      setEditTags(null);
+    } catch (err) {
+      setStatus(`Tag write failed: ${String(err)}`);
+    }
+  }
+
+  // Batch: rewrite title/artist tags of every track currently listed, from their filenames.
+  async function fixTagsFromFilenames() {
+    const lib = folderRef.current;
+    if (!lib || filteredTracks.length === 0) return;
+    setFixBusy(true);
+    setStatus(`Writing tags for ${filteredTracks.length} files…`);
+    try {
+      const report = await invoke<{ updated: Track[]; skipped: number; failed: string[] }>("fix_tags_from_filenames", {
+        args: { paths: filteredTracks.map((t) => t.path), libraryDir: lib },
+      });
+      const byPath = new Map(report.updated.map((t) => [t.path, t] as const));
+      setAllTracks((prev) => prev.map((t) => byPath.get(t.path) ?? t));
+      setStatus(`Tags: ${report.updated.length} updated, ${report.skipped} kept`);
+      setFixReport({ updated: report.updated.length, skipped: report.skipped, failed: report.failed });
+    } catch (err) {
+      setStatus(`Tag write failed: ${String(err)}`);
+    } finally {
+      setFixBusy(false);
+      setConfirmFix(false);
+    }
+  }
 
   function togglePlay() {
     const audio = audioRef.current;
@@ -527,6 +751,7 @@ export default function App() {
         setPlaylist("(all)");
         setQuery("");
         setStatus(`Found ${found.length} tracks`);
+        await loadPlaylists(saved);
       } catch (err) {
         setStatus(`Auto-load failed: ${String(err)}`);
       }
@@ -586,6 +811,7 @@ export default function App() {
             const found = await invoke<Track[]>("scan_music_folder", { dir: lib });
             setAllTracks(found);
             setStatus(`Found ${found.length} tracks`);
+            await loadPlaylists(lib);
           } catch (err) {
             setStatus(`Refresh error: ${String(err)}`);
           }
@@ -770,6 +996,16 @@ export default function App() {
         }
         .iconBtn:hover{ color: var(--text); background: rgba(255,255,255,0.08); }
         .iconBtn.danger:hover{ color: #ff5c7a; border-color: rgba(255,92,122,0.45); background: rgba(255,92,122,0.10); }
+        .iconBtn.small{ width: 30px; height: 30px; border-radius: 9px; }
+        .headerRow{ display:flex; align-items:center; justify-content:space-between; gap: 10px; }
+        .migrateBox{
+          margin: 4px 4px 12px;
+          padding: 12px;
+          border: 1px dashed rgba(0,255,191,0.35);
+          border-radius: 14px;
+          background: rgba(0,255,191,0.05);
+        }
+        .migrateBox code{ color: var(--accent); font-size: 12px; }
 
         /* Confirmation box */
         .modalBackdrop{
@@ -789,6 +1025,10 @@ export default function App() {
         .modalTrack{ font-weight: 700; word-break: break-word; }
         .modalHint{ color: var(--textDim); font-size: 12px; margin-top: 6px; }
         .modalActions{ display:flex; justify-content:flex-end; gap: 10px; margin-top: 18px; }
+        .primaryBtn{ border-color: rgba(0,255,191,0.45); background: rgba(0,255,191,0.12); color: var(--accent); }
+        .primaryBtn:hover{ background: rgba(0,255,191,0.20); }
+        .fieldLabel{ display:block; color: var(--textDim); font-size: 12px; margin: 10px 0 4px; }
+        .fieldInput{ width: 100%; }
         .dangerBtn{ border-color: rgba(255,92,122,0.45); background: rgba(255,92,122,0.12); color: #ff8aa0; }
         .dangerBtn:hover{ background: rgba(255,92,122,0.22); }
         .volume{ display:flex; align-items:center; gap: 6px; }
@@ -1075,44 +1315,101 @@ export default function App() {
       <div className="content">
         <div className="panel">
           <div className="panelHeader tabs">
-            <button
-              className={`tab ${sideTab === "playlists" ? "active" : ""}`}
-              onClick={() => setSideTab("playlists")}
-            >
-              Playlists
+            <button className={`tab ${sideTab === "playlists" ? "active" : ""}`} onClick={() => setSideTab("playlists")}>
+              Playlists <span className="tabCount">{playlistFiles.length}</span>
             </button>
-            <button
-              className={`tab ${sideTab === "artists" ? "active" : ""}`}
-              onClick={() => setSideTab("artists")}
-            >
+            <button className={`tab ${sideTab === "artists" ? "active" : ""}`} onClick={() => setSideTab("artists")}>
               Artists <span className="tabCount">{artists.length}</span>
+            </button>
+            <button className={`tab ${sideTab === "folders" ? "active" : ""}`} onClick={() => setSideTab("folders")} title="Where the files are stored">
+              Folders
             </button>
           </div>
 
           {sideTab === "playlists" ? (
             <>
               <div className="searchRow">
+                {newPlaylistMode ? (
+                  <>
+                    <input
+                      className="search"
+                      placeholder="New playlist name…"
+                      autoFocus
+                      value={newPlaylistName}
+                      onChange={(e) => setNewPlaylistName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") createPlaylist(newPlaylistName);
+                        if (e.key === "Escape") setNewPlaylistMode(false);
+                      }}
+                    />
+                    <button className="btn" onClick={() => createPlaylist(newPlaylistName)} disabled={!newPlaylistName.trim()}>OK</button>
+                  </>
+                ) : (
+                  <>
+                    <input
+                      className="search"
+                      placeholder="Filter playlists…"
+                      value={plQuery}
+                      onChange={(e) => setPlQuery(e.target.value)}
+                    />
+                    <button className="btn" title="New playlist" onClick={() => setNewPlaylistMode(true)} disabled={!folder}>+</button>
+                  </>
+                )}
+              </div>
+              <div className="list">
+                {playlistFiles.length === 0 && folder ? (
+                  <div className="migrateBox">
+                    <div className="modalTrack">No playlist files yet</div>
+                    <div className="modalHint" style={{ margin: "6px 0 10px" }}>
+                      Playlists now live as small <code>.m3u8</code> files in <code>{folder}\_Playlists</code>, so a song can be in several at once.
+                      Create one per existing folder to start from what you have — nothing moves on disk.
+                    </div>
+                    <button className="btn primaryBtn" onClick={createPlaylistsFromFolders}>Create playlists from folders</button>
+                  </div>
+                ) : null}
+                <div
+                  className={`pill ${!plView && !artistView && playlist === "(all)" ? "active" : ""}`}
+                  onClick={() => { setPlView(""); setArtistView(""); setPlaylist("(all)"); }}
+                >
+                  (all)
+                </div>
+                {shownPlaylistFiles.map((p) => (
+                  <div
+                    key={p.name}
+                    className={`pill artistPill ${p.name === plView ? "active" : ""}`}
+                    onClick={() => (plView === p.name ? setPlView("") : openPlaylistView(p.name))}
+                  >
+                    <span className="artistName">{p.name}</span>
+                    <span className="artistCount">{p.entries.length}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : sideTab === "folders" ? (
+            <>
+              <div className="searchRow">
                 <input
                   className="search"
-                  placeholder="Filter playlists…"
+                  placeholder="Filter folders…"
                   value={playlistQuery}
                   onChange={(e) => setPlaylistQuery(e.target.value)}
                 />
               </div>
-            <div className="list">
-              {shownPlaylists.map((p) => (
-                <div
-                  key={p}
-                  className={`pill ${!artistView && p === playlist ? "active" : ""}`}
-                  onClick={() => {
-                    setArtistView("");
-                    setPlaylist(p);
-                  }}
-                >
-                  {p}
-                </div>
-              ))}
-            </div>
+              <div className="list">
+                {shownPlaylists.map((p) => (
+                  <div
+                    key={p}
+                    className={`pill ${!artistView && !plView && p === playlist ? "active" : ""}`}
+                    onClick={() => {
+                      setArtistView("");
+                      setPlView("");
+                      setPlaylist(p);
+                    }}
+                  >
+                    {p}
+                  </div>
+                ))}
+              </div>
             </>
           ) : (
             <>
@@ -1129,7 +1426,7 @@ export default function App() {
                   <div
                     key={a.name}
                     className={`pill artistPill ${a.name === artistView ? "active" : ""}`}
-                    onClick={() => setArtistView((cur) => (cur === a.name ? "" : a.name))}
+                    onClick={() => { setPlView(""); setArtistView((cur) => (cur === a.name ? "" : a.name)); }}
                     title={`All ${a.count} track${a.count === 1 ? "" : "s"} by ${a.name}, across every folder`}
                   >
                     <span className="artistName">{a.name}</span>
@@ -1142,15 +1439,36 @@ export default function App() {
         </div>
 
         <div className="panel">
-          <div className="panelHeader">
-            {artistView ? (
-              <>
-                Tracks · <span className="accentText">{artistView}</span>
-                <span className="dimText"> · all folders</span>
-              </>
-            ) : (
-              "Tracks"
-            )}
+          <div className="panelHeader headerRow">
+            <span>
+              {plView ? (
+                <>
+                  <span className="accentText">{plView}</span>
+                  <span className="dimText"> · playlist · {currentPlaylistFile?.entries.length ?? 0}</span>
+                </>
+              ) : artistView ? (
+                <>
+                  Tracks · <span className="accentText">{artistView}</span>
+                  <span className="dimText"> · all folders</span>
+                </>
+              ) : playlist !== "(all)" ? (
+                <>
+                  <span className="accentText">{playlist}</span>
+                  <span className="dimText"> · folder</span>
+                </>
+              ) : (
+                "Tracks"
+              )}
+            </span>
+            {plView ? (
+              <button
+                className="iconBtn danger small"
+                title={`Delete the playlist "${plView}" (the songs stay)`}
+                onClick={() => setConfirmDeletePlaylist(plView)}
+              >
+                <TrashIcon />
+              </button>
+            ) : null}
           </div>
           <div className="searchRow">
             <input
@@ -1162,11 +1480,44 @@ export default function App() {
             {selectedTrack ? (
               <Dropdown
                 value=""
-                placeholder="Move selected to…"
-                title={`Move "${displayName(selectedTrack.name)}" to another playlist folder`}
+                placeholder="Add to playlist…"
+                title={`Add "${displayName(selectedTrack.name)}" to a playlist`}
+                options={playlistFiles.filter((p) => !inPlaylist(p, selectedTrack)).map((p) => p.name)}
+                extra={{ label: "+ New playlist…", value: NEW_PLAYLIST_SENTINEL }}
+                onSelect={(v) => {
+                  if (v === NEW_PLAYLIST_SENTINEL) {
+                    setSideTab("playlists");
+                    setNewPlaylistMode(true);
+                  } else addToPlaylist(v, [selectedTrack]);
+                }}
+              />
+            ) : null}
+            {selectedTrack && plView && currentPlaylistFile && inPlaylist(currentPlaylistFile, selectedTrack) ? (
+              <button
+                className="btn"
+                title={`Remove "${displayName(selectedTrack.name)}" from ${plView} (the file stays)`}
+                onClick={() => removeFromPlaylist(plView, [selectedTrack])}
+              >
+                Remove from playlist
+              </button>
+            ) : null}
+            {selectedTrack && sideTab === "folders" ? (
+              <Dropdown
+                value=""
+                placeholder="Move file to…"
+                title={`Move the file "${displayName(selectedTrack.name)}" to another folder (playlists follow)`}
                 options={targetOptions.filter((name) => name !== (selectedTrack.playlist || "(root)"))}
                 onSelect={(target) => moveTrackTo(selectedTrack.path, target)}
               />
+            ) : null}
+            {selectedTrack ? (
+              <button
+                className="iconBtn"
+                title={`Edit the tags of "${displayName(selectedTrack.name)}"`}
+                onClick={() => openTagEditor(selectedTrack)}
+              >
+                <PencilIcon />
+              </button>
             ) : null}
             {selectedTrack ? (
               <button
@@ -1177,6 +1528,14 @@ export default function App() {
                 <TrashIcon />
               </button>
             ) : null}
+            <button
+              className="btn"
+              disabled={fixBusy || filteredTracks.length === 0}
+              title="Rewrite the title/artist tags of every track listed here from its 'Song - Artist' filename"
+              onClick={() => setConfirmFix(true)}
+            >
+              {fixBusy ? "Writing…" : "Tags ← names"}
+            </button>
             <button
               className={`shuffleBtn ${shuffle ? "on" : ""}`}
               onClick={() => setShuffle((s) => !s)}
@@ -1215,10 +1574,10 @@ export default function App() {
               className="ddSmall"
               up
               value=""
-              placeholder="Move to…"
-              title="Move this track to another playlist folder"
-              options={targetOptions.filter((name) => name !== currentPlaylist)}
-              onSelect={(target) => moveTrackTo(currentPath, target)}
+              placeholder="Add to playlist…"
+              title="Add the playing track to a playlist"
+              options={playlistFiles.filter((p) => !(currentTrack && inPlaylist(p, currentTrack))).map((p) => p.name)}
+              onSelect={(name) => { if (currentTrack) addToPlaylist(name, [currentTrack]); }}
             />
           ) : null}
         </div>
@@ -1277,6 +1636,98 @@ export default function App() {
 
         <audio ref={audioRef} preload="metadata" />
       </div>
+
+      {editTags ? (
+        <div className="modalBackdrop" onMouseDown={() => setEditTags(null)}>
+          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="modalTitle">Edit tags</div>
+            <div className="modalHint" style={{ marginBottom: 12 }}>{editTags.track.name}</div>
+            <label className="fieldLabel">Title</label>
+            <input
+              className="downloadInput fieldInput"
+              value={editTags.title}
+              autoFocus
+              onChange={(e) => setEditTags({ ...editTags, title: e.target.value })}
+              onKeyDown={(e) => { if (e.key === "Enter") saveTags(); }}
+            />
+            <label className="fieldLabel">Artist</label>
+            <input
+              className="downloadInput fieldInput"
+              value={editTags.artist}
+              onChange={(e) => setEditTags({ ...editTags, artist: e.target.value })}
+              onKeyDown={(e) => { if (e.key === "Enter") saveTags(); }}
+            />
+            <div className="modalActions">
+              <button
+                className="btn"
+                title="Fill both fields from the filename ('Song - Artist')"
+                onClick={() => setEditTags({ ...editTags, ...titleArtistFromName(editTags.track.name) })}
+              >
+                From filename
+              </button>
+              <span style={{ flex: 1 }} />
+              <button className="btn" onClick={() => setEditTags(null)}>Cancel</button>
+              <button className="btn primaryBtn" onClick={saveTags}>Save</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {confirmFix ? (
+        <div className="modalBackdrop" onMouseDown={() => setConfirmFix(false)}>
+          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="modalTitle">Write tags from filenames?</div>
+            <div className="modalBody">
+              <div className="modalTrack">{filteredTracks.length} track{filteredTracks.length === 1 ? "" : "s"} currently listed</div>
+              <div className="modalHint">
+                Conservative: a file's title/artist tag is replaced from its "Song - Artist" name only when the tag is <b>empty</b> or looks like raw YouTube output
+                ("(Official Video)", "[Lyric Video]", "| Channel", a video id…). Curated tags — even ones that differ from a shortened filename — are kept.
+                This edits the files themselves; the phone and other players will show the result.
+              </div>
+            </div>
+            <div className="modalActions">
+              <button className="btn" onClick={() => setConfirmFix(false)} autoFocus>Cancel</button>
+              <button className="btn primaryBtn" onClick={fixTagsFromFilenames} disabled={fixBusy}>Write tags</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {fixReport ? (
+        <div className="modalBackdrop" onMouseDown={() => setFixReport(null)}>
+          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="modalTitle">Tags written</div>
+            <div className="modalBody">
+              <div className="modalTrack">
+                {fixReport.updated} updated · {fixReport.skipped} kept as they were
+                {fixReport.failed.length ? ` · ${fixReport.failed.length} failed` : ""}
+              </div>
+              {fixReport.failed.length ? (
+                <div className="modalHint" style={{ whiteSpace: "pre-wrap" }}>{fixReport.failed.slice(0, 8).join("\n")}</div>
+              ) : null}
+            </div>
+            <div className="modalActions">
+              <button className="btn primaryBtn" onClick={() => setFixReport(null)} autoFocus>OK</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {confirmDeletePlaylist ? (
+        <div className="modalBackdrop" onMouseDown={() => setConfirmDeletePlaylist("")}>
+          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="modalTitle">Delete this playlist?</div>
+            <div className="modalBody">
+              <div className="modalTrack">{confirmDeletePlaylist}</div>
+              <div className="modalHint">Only the playlist file goes to the Recycle Bin. The songs stay exactly where they are.</div>
+            </div>
+            <div className="modalActions">
+              <button className="btn" onClick={() => setConfirmDeletePlaylist("")} autoFocus>Cancel</button>
+              <button className="btn dangerBtn" onClick={() => deletePlaylist(confirmDeletePlaylist)}>Delete playlist</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {confirmDelete ? (
         <div className="modalBackdrop" onMouseDown={() => setConfirmDelete(null)}>
