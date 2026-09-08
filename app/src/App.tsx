@@ -269,6 +269,10 @@ export default function App() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   const [folder, setFolder] = useState<string>("");
+  // "windows" | "linux" | "macos" | "android" | "ios" (from Rust). Phones: no folder picker, no Recycle Bin.
+  const [platform, setPlatform] = useState<string>("");
+  const isMobile = platform === "android" || platform === "ios";
+  const [pathInput, setPathInput] = useState<string>("");
   const [status, setStatus] = useState<string>("Idle");
   const [allTracks, setAllTracks] = useState<Track[]>([]);
 
@@ -661,6 +665,29 @@ export default function App() {
     }
   }
 
+  // Mobile: type the folder path instead of picking it.
+  async function importFolderPath(path: string) {
+    const dir = path.trim();
+    if (!dir) return;
+    try {
+      setFolder(dir);
+      setStatus("Scanning…");
+      const store = await storePromise;
+      await store.set(KEY_LIBRARY_DIR, dir);
+      await store.save();
+      const found = await invoke<Track[]>("scan_music_folder", { dir });
+      setAllTracks(found);
+      setPlaylist("(all)");
+      setPlView("");
+      setArtistView("");
+      setQuery("");
+      setStatus(`Found ${found.length} tracks`);
+      await loadPlaylists(dir);
+    } catch (err) {
+      setStatus(`Scan error: ${String(err)}`);
+    }
+  }
+
   async function importFolder() {
     try {
       const picked = await open({ directory: true, multiple: false });
@@ -920,6 +947,14 @@ export default function App() {
       try {
         const store = await storePromise;
 
+        let os = "";
+        try {
+          os = await invoke<string>("platform");
+          setPlatform(os);
+        } catch {
+          /* older backend */
+        }
+
         const savedTarget = await store.get<string>(KEY_DOWNLOAD_TARGET);
         if (savedTarget && typeof savedTarget === "string") setDlTarget(savedTarget);
 
@@ -933,7 +968,13 @@ export default function App() {
         if (typeof savedVolume === "number" && savedVolume >= 0 && savedVolume <= 1) setVolume(savedVolume);
         settingsLoadedRef.current = true;
 
-        const saved = await store.get<string>(KEY_LIBRARY_DIR);
+        let saved = await store.get<string>(KEY_LIBRARY_DIR);
+        // Android: no folder picker (it returns content URIs, not paths) — start from the standard Music folder.
+        if ((!saved || typeof saved !== "string") && os === "android") {
+          saved = "/storage/emulated/0/Music";
+          await store.set(KEY_LIBRARY_DIR, saved);
+          await store.save();
+        }
         if (!saved || typeof saved !== "string") return;
 
         setFolder(saved);
@@ -1473,7 +1514,20 @@ export default function App() {
       <div className="topbar">
         <div className="brand">
           <div>music-hood</div>
-          <button className="btn" onClick={importFolder}>Import</button>
+          {isMobile ? (
+            <>
+              <input
+                className="downloadInput targetNew"
+                placeholder="/storage/emulated/0/Music"
+                value={pathInput}
+                onChange={(e) => setPathInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") importFolderPath(pathInput); }}
+              />
+              <button className="btn" onClick={() => importFolderPath(pathInput)} disabled={!pathInput.trim()}>Use</button>
+            </>
+          ) : (
+            <button className="btn" onClick={importFolder}>Import</button>
+          )}
           {folder ? (
             <button className="btn" onClick={rescanLibrary} title="Re-read the Music folder">
               Rescan
@@ -1993,7 +2047,9 @@ export default function App() {
                 {confirmDelete.length > 12 ? <div className="dimText">…and {confirmDelete.length - 12} more</div> : null}
               </div>
               <div className="modalHint">
-                The files go to the Windows Recycle Bin, so this can be undone from there. Playlists are updated.
+                {isMobile
+                  ? "On the phone there is no Recycle Bin: the files are deleted for real. Playlists are updated."
+                  : "The files go to the Windows Recycle Bin, so this can be undone from there. Playlists are updated."}
               </div>
             </div>
             <div className="modalActions">

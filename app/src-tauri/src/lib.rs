@@ -4,7 +4,9 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
-use tauri_plugin_shell::process::{CommandEvent};
+#[cfg(desktop)]
+use tauri_plugin_shell::process::CommandEvent;
+#[cfg(desktop)]
 use tauri_plugin_shell::ShellExt;
 
 use lofty::prelude::*;
@@ -336,7 +338,7 @@ fn playlist_delete(args: PlaylistEditArgs) -> Result<(), String> {
   if !file.is_file() {
     return Err(format!("No playlist named {}", args.name));
   }
-  trash::delete(&file).map_err(|e| format!("Could not move playlist to Recycle Bin: {e}"))
+  send_to_bin(&file)
 }
 
 /// One-time migration: one playlist file per existing first-level folder, in filename order.
@@ -609,12 +611,26 @@ fn delete_track(args: DeleteArgs) -> Result<(), String> {
   if !src.starts_with(&root) {
     return Err("Track is outside the Music folder".into());
   }
-  trash::delete(&src).map_err(|e| format!("Could not move to Recycle Bin: {e}"))?;
+  send_to_bin(&src)?;
   update_playlists_for_path(&root, &src, None);
   Ok(())
 }
 
+/// Desktop: Recycle Bin / Trash. Mobile has none, so the file is removed for real
+/// (the confirmation box says so on the phone).
+fn send_to_bin(path: &Path) -> Result<(), String> {
+  #[cfg(desktop)]
+  {
+    trash::delete(path).map_err(|e| format!("Could not move to Recycle Bin: {e}"))
+  }
+  #[cfg(mobile)]
+  {
+    std::fs::remove_file(path).map_err(|e| format!("Could not delete: {e}"))
+  }
+}
+
 /// Newest audio file in `dir` modified at/after `since` (with a little slack for clock granularity).
+#[cfg(desktop)]
 fn newest_audio_since(dir: &Path, since: std::time::SystemTime) -> Option<PathBuf> {
   let floor = since.checked_sub(std::time::Duration::from_secs(5)).unwrap_or(since);
   let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
@@ -634,6 +650,7 @@ fn newest_audio_since(dir: &Path, since: std::time::SystemTime) -> Option<PathBu
   best.map(|(_, p)| p)
 }
 
+#[cfg(desktop)]
 fn find_bin_by_prefix(dir: &Path, prefix: &str) -> Option<PathBuf> {
   let entries = std::fs::read_dir(dir).ok()?;
   for e in entries.flatten() {
@@ -649,6 +666,7 @@ fn find_bin_by_prefix(dir: &Path, prefix: &str) -> Option<PathBuf> {
   None
 }
 
+#[cfg(desktop)]
 fn sidecar_bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
   // Dev: binaries are in src-tauri/bin
   if cfg!(debug_assertions) {
@@ -663,6 +681,13 @@ fn sidecar_bin_dir(app: &AppHandle) -> Result<PathBuf, String> {
   Ok(res.join("bin"))
 }
 
+#[cfg(mobile)]
+#[tauri::command]
+async fn ytdlp_download_audio(_app: AppHandle, _args: YtDlpArgs) -> Result<(), String> {
+  Err("Downloading is not available on the phone yet — it lands with the on-device downloader.".into())
+}
+
+#[cfg(desktop)]
 #[tauri::command]
 async fn ytdlp_download_audio(app: AppHandle, args: YtDlpArgs) -> Result<(), String> {
   let url = args.url;
@@ -775,6 +800,13 @@ async fn ytdlp_download_audio(app: AppHandle, args: YtDlpArgs) -> Result<(), Str
   Ok(())
 }
 
+/// "windows" | "linux" | "macos" | "android" | "ios" — lets the UI adapt (paths, layout, what is available).
+#[tauri::command]
+fn platform() -> String {
+  std::env::consts::OS.to_string()
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
@@ -792,7 +824,8 @@ pub fn run() {
       playlist_remove,
       playlist_create,
       playlist_delete,
-      playlists_from_folders
+      playlists_from_folders,
+      platform
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
